@@ -1,0 +1,6 @@
+title: Anticheat Telemetry
+description: Windows Ring 0/3 process-integrity telemetry and integration documentation.
+theme: jekyll-theme-cayman
+show_downloads: true
+github:
+  repository_url: https://github.com/amandykovxd/anticheat
