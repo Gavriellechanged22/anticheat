@@ -337,6 +337,7 @@ tools/
 - [Event schema](docs/event-schema.md)
 - [Security model](SECURITY.md)
 - [Technical roadmap](ROADMAP.md)
+- [Engineering project contract](docs/project-board.md)
 - [Technical support](SUPPORT.md)
 - [Wiki source](docs/wiki/Home.md)
 
