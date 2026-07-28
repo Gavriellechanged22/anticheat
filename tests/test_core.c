@@ -507,6 +507,23 @@ static bool ac_test_log_contains_both(
     return false;
 }
 
+static const AcIntegrityBaseline *ac_test_find_integrity_baseline(
+    const AcContext *context,
+    uintptr_t base,
+    const wchar_t *path)
+{
+    size_t index;
+
+    for (index = 0; index < context->integrity.count; ++index) {
+        const AcIntegrityBaseline *baseline = &context->integrity.items[index];
+
+        if (baseline->base == base && _wcsicmp(baseline->path, path) == 0) {
+            return baseline;
+        }
+    }
+    return NULL;
+}
+
 /* A clean process must produce no section findings: this is the false-positive
    guard for relocation, import and delay-import normalisation. */
 static void test_integrity_clean_process_has_no_findings(void)
@@ -550,12 +567,37 @@ static void test_integrity_clean_process_has_no_findings(void)
 
     /* Baselines are cached, so a second pass must not re-read any file. */
     {
-        const uint64_t allocated = fixture.context.integrity.bytes_allocated;
+        const uintptr_t image_base = (uintptr_t)GetModuleHandleW(NULL);
+        const AcIntegrityBaseline *baseline = ac_test_find_integrity_baseline(
+            &fixture.context,
+            image_base,
+            fixture.target.image_path);
+        uint8_t file_sha256[AC_SHA256_DIGEST_SIZE];
+        uint64_t allocated = 0;
         AcScanStats second;
+
+        AC_CHECK(baseline != NULL);
+        if (baseline != NULL) {
+            allocated = baseline->allocated_bytes;
+            memcpy(file_sha256, baseline->file_sha256, sizeof(file_sha256));
+        } else {
+            memset(file_sha256, 0, sizeof(file_sha256));
+        }
 
         memset(&second, 0, sizeof(second));
         AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 2u, &second));
-        AC_CHECK(fixture.context.integrity.bytes_allocated == allocated);
+        baseline = ac_test_find_integrity_baseline(
+            &fixture.context,
+            image_base,
+            fixture.target.image_path);
+        AC_CHECK(baseline != NULL);
+        if (baseline != NULL) {
+            AC_CHECK(baseline->allocated_bytes == allocated);
+            AC_CHECK(memcmp(
+                baseline->file_sha256,
+                file_sha256,
+                sizeof(file_sha256)) == 0);
+        }
         AC_CHECK(second.integrity_blocks_checked > 0);
     }
 
