@@ -1,0 +1,54 @@
+name: Engineering proposal
+description: Propose a bounded technical capability or integration change.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - User-mode collector
+        - Kernel driver
+        - Driver protocol
+        - Portable core
+        - Event schema
+        - Integration tooling
+        - Build or CI
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Technical problem
+      description: Define the current limitation and affected integration.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed contract
+      description: Define inputs, outputs, failure behavior, limits, and compatibility requirements.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and kernel impact
+      description: Address trust boundaries, privileges, IRQL, memory lifetime, IOCTL validation, and data exposure as applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Provide measurable build, test, performance, and compatibility criteria.
+    validations:
+      required: true

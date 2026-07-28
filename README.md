@@ -1,5 +1,10 @@
 # Anticheat Telemetry
 
+[![build-and-test](https://github.com/amandykovxd/anticheat/actions/workflows/windows-build.yml/badge.svg)](https://github.com/amandykovxd/anticheat/actions/workflows/windows-build.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](#supported-configurations)
+[![Language: C11](https://img.shields.io/badge/language-C11-555555.svg)](CMakeLists.txt)
+
 Anticheat Telemetry is a Windows process-integrity sensor composed of:
 
 - `AcTelemetry.sys`: optional x64 kernel telemetry driver;
@@ -331,6 +336,20 @@ tools/
 - [Event schema](docs/event-schema.md)
 - [Security model](SECURITY.md)
 - [Technical roadmap](ROADMAP.md)
+
+## Contributing
+
+External contributors can fork the repository, push a focused feature branch,
+and open a pull request. Repository collaborators can push feature branches
+directly to this repository. All changes enter `main` through owner-reviewed
+pull requests with required x64, Win32, and sanitizer checks.
+
+Start with:
+
+- [Contribution requirements](CONTRIBUTING.md)
+- [`good first issue` tasks](https://github.com/amandykovxd/anticheat/labels/good%20first%20issue)
+- [`help wanted` tasks](https://github.com/amandykovxd/anticheat/labels/help%20wanted)
+- [Integration and design discussions](https://github.com/amandykovxd/anticheat/discussions)
 
 ## License
 

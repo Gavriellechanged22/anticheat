@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/amandykovxd/anticheat/security/advisories/new
+    about: Report kernel, authorization, or protocol vulnerabilities privately.
+  - name: Integration and design discussion
+    url: https://github.com/amandykovxd/anticheat/discussions
+    about: Discuss integration questions and design proposals before implementation.

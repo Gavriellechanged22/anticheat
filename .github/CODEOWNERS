@@ -1,0 +1,8 @@
+# The repository owner approves every change to the protected main branch.
+* @amandykovxd
+
+# Kernel and protocol changes require explicit owner review.
+/driver/ @amandykovxd
+/include/ac_driver_protocol.h @amandykovxd
+/src/kernel_client.c @amandykovxd
+/SECURITY.md @amandykovxd
