@@ -303,17 +303,6 @@ static void test_policy_defaults(void)
     AC_CHECK(policy.probe_region_content);
 }
 
-static void test_driver_protocol_layout(void)
-{
-    AC_CHECK(sizeof(AcDriverVersion) == 16u);
-    AC_CHECK(sizeof(AcDriverTargetRequest) == 16u);
-    AC_CHECK(sizeof(AcDriverStats) == 48u);
-    AC_CHECK(sizeof(AcDriverEvent) == 584u);
-    AC_CHECK(IOCTL_AC_GET_VERSION != IOCTL_AC_SET_TARGET);
-    AC_CHECK(IOCTL_AC_SET_TARGET != IOCTL_AC_READ_EVENTS);
-    AC_CHECK(IOCTL_AC_READ_EVENTS != IOCTL_AC_GET_STATS);
-}
-
 static void test_open_process_uses_read_only_access(void)
 {
     DWORD granted = 0;
@@ -402,7 +391,6 @@ int main(void)
     test_log_chain_is_verifiable();
     test_log_rotation();
     test_policy_defaults();
-    test_driver_protocol_layout();
     test_open_process_uses_read_only_access();
     test_scan_of_self_produces_events();
 

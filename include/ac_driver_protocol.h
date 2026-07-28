@@ -94,12 +94,24 @@ static_assert(sizeof(AcDriverVersion) == 16u, "protocol layout mismatch");
 static_assert(sizeof(AcDriverTargetRequest) == 16u, "protocol layout mismatch");
 static_assert(sizeof(AcDriverStats) == 48u, "protocol layout mismatch");
 static_assert(sizeof(AcDriverEvent) == 584u, "protocol layout mismatch");
+static_assert(IOCTL_AC_GET_VERSION != IOCTL_AC_SET_TARGET,
+              "IOCTL values must be unique");
+static_assert(IOCTL_AC_SET_TARGET != IOCTL_AC_READ_EVENTS,
+              "IOCTL values must be unique");
+static_assert(IOCTL_AC_READ_EVENTS != IOCTL_AC_GET_STATS,
+              "IOCTL values must be unique");
 #elif defined(_MSC_VER) || \
       (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
 _Static_assert(sizeof(AcDriverVersion) == 16u, "protocol layout mismatch");
 _Static_assert(sizeof(AcDriverTargetRequest) == 16u, "protocol layout mismatch");
 _Static_assert(sizeof(AcDriverStats) == 48u, "protocol layout mismatch");
 _Static_assert(sizeof(AcDriverEvent) == 584u, "protocol layout mismatch");
+_Static_assert(IOCTL_AC_GET_VERSION != IOCTL_AC_SET_TARGET,
+               "IOCTL values must be unique");
+_Static_assert(IOCTL_AC_SET_TARGET != IOCTL_AC_READ_EVENTS,
+               "IOCTL values must be unique");
+_Static_assert(IOCTL_AC_READ_EVENTS != IOCTL_AC_GET_STATS,
+               "IOCTL values must be unique");
 #endif
 
 #endif
