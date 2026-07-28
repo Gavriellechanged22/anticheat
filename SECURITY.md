@@ -107,6 +107,12 @@ The collector reads:
 The collector does not include network transport. Integrators control the log
 path, ACL, retention, and forwarding implementation.
 
+The command-line invoker is a trusted configuration authority for the log
+path. The collector does not elevate its token and does not expose an IPC
+operation that accepts a log path. A launcher or service wrapper running the
+collector with elevated privileges must use a fixed deployment-owned log
+location and must not forward an untrusted user's path into `--log`.
+
 ## Device access
 
 `AcTelemetry.sys` applies this SDDL to the device object:
