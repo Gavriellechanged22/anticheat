@@ -1,0 +1,8 @@
+/build/
+/out/
+/.vs/
+/.vscode/
+*.jsonl
+*.exe
+*.obj
+*.pdb
