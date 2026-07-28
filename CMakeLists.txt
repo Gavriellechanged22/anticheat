@@ -52,6 +52,48 @@ if(BUILD_TESTING)
     endforeach()
 endif()
 
+if(APPLE)
+    add_executable(anticheat src/macos_main.c)
+    target_link_libraries(anticheat PRIVATE anticheat_portable)
+    target_compile_features(anticheat PRIVATE c_std_11)
+    ac_enable_warnings(anticheat)
+
+    if(BUILD_TESTING)
+        set(AC_MACOS_CLI_TEST_CASES version version_conflict help)
+        foreach(test_case IN LISTS AC_MACOS_CLI_TEST_CASES)
+            add_test(
+                NAME "macos.cli.${test_case}"
+                COMMAND
+                    ${CMAKE_COMMAND}
+                    "-DAC_CASE=${test_case}"
+                    "-DAC_EXECUTABLE=$<TARGET_FILE:anticheat>"
+                    "-DAC_WORKING_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/macos-cli/${test_case}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.cmake"
+            )
+            set_tests_properties(
+                "macos.cli.${test_case}"
+                PROPERTIES LABELS "cli;macos" TIMEOUT 30
+            )
+        endforeach()
+
+        add_test(
+            NAME macos.live_self_scan
+            COMMAND
+                ${CMAKE_COMMAND}
+                "-DAC_EXECUTABLE=$<TARGET_FILE:anticheat>"
+                "-DAC_LOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/macos-self-scan.jsonl"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_macos_smoke.cmake"
+        )
+        set_tests_properties(
+            macos.live_self_scan
+            PROPERTIES LABELS "macos;integration" TIMEOUT 30
+        )
+    endif()
+
+    install(TARGETS anticheat RUNTIME DESTINATION bin)
+    return()
+endif()
+
 if(NOT WIN32)
     message(STATUS
         "Non-Windows host: building the portable core and its tests only. "

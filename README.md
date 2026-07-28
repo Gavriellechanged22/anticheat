@@ -58,6 +58,7 @@ device is exclusive and accessible only to `SYSTEM` and local
 | --- | --- | --- |
 | Kernel driver | x64 | Visual Studio, matching Windows SDK and WDK |
 | User-mode collector | x64, Win32 | Visual Studio 2022 and CMake 3.24+ |
+| macOS user-mode collector | Apple Silicon, Intel | Xcode Command Line Tools and CMake 3.24+ |
 | Portable core tests | Linux, macOS, Windows | C11 compiler and CMake |
 | Log verifier | Platform-independent | Python 3 |
 
@@ -132,6 +133,31 @@ ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
 The available labels are `portable`, `core`, `cli`, and `windows`.
 The Windows CI matrix rejects a configuration that does not expose exactly 24
 independent cases.
+
+## Build and run on macOS
+
+The macOS target is a user-mode `libproc` collector. It records process
+identity and executable-region metadata without requesting a Mach task port,
+reading process memory, or modifying the target.
+
+```bash
+cmake --preset macos
+cmake --build --preset macos-release
+ctest --preset macos-release
+cmake --install out/build/macos --prefix out/install/macos
+./out/install/macos/bin/anticheat --pid 1234 --once --log anticheat-events.jsonl
+```
+
+Target selection by process name is also supported:
+
+```bash
+./out/install/macos/bin/anticheat --process game --interval-ms 5000
+```
+
+macOS does not use the Windows WDK driver or its IOCTL transport. System
+Integrity Protection, process ownership, and platform privacy controls may
+limit metadata visibility for unrelated processes. See
+[docs/macos-integration.md](docs/macos-integration.md).
 
 ## Build the kernel driver
 

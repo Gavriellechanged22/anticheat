@@ -74,6 +74,45 @@ jobs:
             smoke.jsonl
           if-no-files-found: error
 
+  macos:
+    name: macos user-mode collector
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: cmake --preset macos
+
+      - name: Build
+        run: cmake --build --preset macos-release
+
+      - name: Test
+        run: ctest --preset macos-release
+
+      - name: Install
+        run: cmake --install out/build/macos --prefix out/install/macos
+
+      - name: End-to-end self scan
+        run: |
+          out/install/macos/bin/anticheat \
+            --self \
+            --once \
+            --quiet \
+            --log macos-smoke.jsonl
+
+      - name: Verify the tamper-evident log chain
+        run: python3 tools/verify_log.py macos-smoke.jsonl
+
+      - name: Upload collector and sample log
+        uses: actions/upload-artifact@v4
+        with:
+          name: anticheat-macos
+          path: |
+            out/install/macos/bin/anticheat
+            macos-smoke.jsonl
+          if-no-files-found: error
+
   portable-core:
     name: portable core (sanitizers)
     runs-on: ubuntu-latest

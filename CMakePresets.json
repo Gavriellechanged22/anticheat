@@ -29,6 +29,21 @@
       "inherits": "windows-base",
       "architecture": "Win32",
       "binaryDir": "${sourceDir}/out/build/windows-win32"
+    },
+    {
+      "name": "macos",
+      "displayName": "macOS user-mode collector",
+      "description": "Configure the native macOS collector and portable tests.",
+      "binaryDir": "${sourceDir}/out/build/macos",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     }
   ],
   "buildPresets": [
@@ -43,6 +58,11 @@
       "displayName": "Build Windows Win32 Release",
       "configurePreset": "windows-win32",
       "configuration": "Release"
+    },
+    {
+      "name": "macos-release",
+      "displayName": "Build macOS Release",
+      "configurePreset": "macos"
     }
   ],
   "testPresets": [
@@ -63,6 +83,17 @@
       "displayName": "Test Windows Win32 Release",
       "configurePreset": "windows-win32",
       "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "macos-release",
+      "displayName": "Test macOS Release",
+      "configurePreset": "macos",
       "output": {
         "outputOnFailure": true
       },
