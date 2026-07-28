@@ -700,6 +700,9 @@ static void test_driver_protocol_session_layout(void)
 {
     AcDriverTargetRequest request;
     AcDriverStats stats;
+    volatile uint32_t protocol_version;
+    volatile size_t request_size;
+    volatile size_t stats_size;
 
     memset(&request, 0, sizeof(request));
     memset(&stats, 0, sizeof(stats));
@@ -707,10 +710,13 @@ static void test_driver_protocol_session_layout(void)
     request.protocol_version = AC_DRIVER_PROTOCOL_VERSION;
     request.target_pid = 42u;
     request.session_id = UINT64_C(0x0102030405060708);
+    protocol_version = AC_DRIVER_PROTOCOL_VERSION;
+    request_size = sizeof(request);
+    stats_size = sizeof(stats);
 
-    AC_CHECK(AC_DRIVER_PROTOCOL_VERSION == 2u);
-    AC_CHECK(sizeof(request) == 24u);
-    AC_CHECK(sizeof(stats) == 56u);
+    AC_CHECK(protocol_version == 2u);
+    AC_CHECK(request_size == 24u);
+    AC_CHECK(stats_size == 56u);
     AC_CHECK(request.session_id != 0);
     AC_CHECK(request.reserved == 0);
 }
