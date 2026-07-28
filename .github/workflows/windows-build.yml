@@ -1,4 +1,4 @@
-name: windows-build
+name: build-and-test
 
 on:
   push:
@@ -8,17 +8,68 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
+  windows:
+    name: windows ${{ matrix.arch }}
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, Win32]
 
     steps:
       - uses: actions/checkout@v6
 
       - name: Configure
-        run: cmake -S . -B build -A x64
+        run: cmake -S . -B build -A ${{ matrix.arch }}
 
       - name: Build
         run: cmake --build build --config Release
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: End-to-end scan against a live process
+        shell: pwsh
+        run: |
+          $target = Start-Process -PassThru -FilePath powershell `
+            -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 120'
+          try {
+            & .\build\Release\anticheat.exe --pid $target.Id --once --quiet --log smoke.jsonl
+            if ($LASTEXITCODE -ne 0) {
+              throw "agent exited with $LASTEXITCODE"
+            }
+          } finally {
+            Stop-Process -Id $target.Id -Force -ErrorAction SilentlyContinue
+          }
+          Get-Content smoke.jsonl | Select-Object -First 5
+
+      - name: Verify the tamper-evident log chain
+        run: python tools/verify_log.py smoke.jsonl
+
+      - name: Upload agent and sample log
+        uses: actions/upload-artifact@v4
+        with:
+          name: anticheat-${{ matrix.arch }}
+          path: |
+            build/Release/anticheat.exe
+            smoke.jsonl
+          if-no-files-found: error
+
+  portable-core:
+    name: portable core (sanitizers)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build and test under AddressSanitizer and UBSan
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+
+      - name: Log verifier self-test
+        run: python3 tools/verify_log.py --self-test

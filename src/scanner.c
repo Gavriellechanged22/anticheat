@@ -6,6 +6,20 @@
 #include <tlhelp32.h>
 #include <wchar.h>
 
+#define AC_MAX_REGION_EVENTS_PER_SCAN 64u
+#define AC_FILE_HASH_LIMIT (256ull * 1024ull * 1024ull)
+#define AC_FILE_HASH_CHUNK (64u * 1024u)
+
+typedef struct AcRegionFinding {
+    const char *reason;
+    AcSeverity severity;
+    bool backed_by_module;
+    bool pe_header;
+    bool content_hashed;
+    uint16_t pe_machine;
+    char content_sha256[AC_SHA256_HEX_SIZE];
+} AcRegionFinding;
+
 static bool ac_is_executable_protection(DWORD protection)
 {
     const DWORD base = protection & 0xffu;
@@ -18,10 +32,7 @@ static bool ac_is_executable_protection(DWORD protection)
 
 static bool ac_is_writable_executable(DWORD protection)
 {
-    const DWORD base = protection & 0xffu;
-
-    return base == PAGE_EXECUTE_READWRITE ||
-           base == PAGE_EXECUTE_WRITECOPY;
+    return (protection & 0xffu) == PAGE_EXECUTE_READWRITE;
 }
 
 static const char *ac_memory_type_name(DWORD type)
@@ -34,24 +45,82 @@ static const char *ac_memory_type_name(DWORD type)
     }
 }
 
-static bool ac_ranges_overlap_or_contain(
-    uintptr_t outer_base,
-    size_t outer_size,
-    uintptr_t inner_base,
-    size_t inner_size)
+static unsigned int ac_size_bucket(uint64_t size)
 {
-    uintptr_t outer_end;
-    uintptr_t inner_end;
+    unsigned int bucket = 0;
 
-    if (outer_size == 0 || inner_size == 0 ||
-        outer_base > UINTPTR_MAX - outer_size ||
-        inner_base > UINTPTR_MAX - inner_size) {
+    while (size > 1u && bucket < 63u) {
+        size >>= 1;
+        ++bucket;
+    }
+    return bucket;
+}
+
+void ac_module_list_init(AcModuleList *modules)
+{
+    if (modules == NULL) {
+        return;
+    }
+    modules->items = NULL;
+    modules->count = 0;
+    modules->capacity = 0;
+    modules->truncated = false;
+}
+
+void ac_module_list_free(AcModuleList *modules)
+{
+    if (modules == NULL) {
+        return;
+    }
+    free(modules->items);
+    ac_module_list_init(modules);
+}
+
+bool ac_module_list_push(
+    AcModuleList *modules,
+    uintptr_t base,
+    size_t size,
+    const wchar_t *path)
+{
+    AcModule *module;
+
+    if (modules == NULL) {
         return false;
     }
 
-    outer_end = outer_base + outer_size;
-    inner_end = inner_base + inner_size;
-    return inner_base >= outer_base && inner_end <= outer_end;
+    if (modules->count >= AC_MAX_MODULES) {
+        modules->truncated = true;
+        return false;
+    }
+
+    if (modules->count == modules->capacity) {
+        const size_t capacity = modules->capacity == 0 ? 128u : modules->capacity * 2u;
+        AcModule *items;
+
+        if (capacity > SIZE_MAX / sizeof(AcModule)) {
+            return false;
+        }
+        items = (AcModule *)realloc(modules->items, capacity * sizeof(AcModule));
+        if (items == NULL) {
+            return false;
+        }
+        modules->items = items;
+        modules->capacity = capacity;
+    }
+
+    module = &modules->items[modules->count];
+    module->base = base;
+    module->size = size;
+    module->path[0] = L'\0';
+    if (path != NULL) {
+        (void)wcsncpy_s(
+            module->path,
+            sizeof(module->path) / sizeof(module->path[0]),
+            path,
+            _TRUNCATE);
+    }
+    ++modules->count;
+    return true;
 }
 
 bool ac_collect_modules(DWORD pid, AcModuleList *modules, DWORD *error_out)
@@ -68,7 +137,8 @@ bool ac_collect_modules(DWORD pid, AcModuleList *modules, DWORD *error_out)
         return false;
     }
 
-    memset(modules, 0, sizeof(*modules));
+    modules->count = 0;
+    modules->truncated = false;
 
     for (attempt = 0; attempt < AC_MAX_SNAPSHOT_RETRIES; ++attempt) {
         snapshot = CreateToolhelp32Snapshot(
@@ -85,7 +155,7 @@ bool ac_collect_modules(DWORD pid, AcModuleList *modules, DWORD *error_out)
             }
             return false;
         }
-        SwitchToThread();
+        Sleep(attempt < 4u ? 0u : 10u);
     }
 
     if (snapshot == INVALID_HANDLE_VALUE) {
@@ -101,32 +171,32 @@ bool ac_collect_modules(DWORD pid, AcModuleList *modules, DWORD *error_out)
         error = GetLastError();
         CloseHandle(snapshot);
         if (error_out != NULL) {
-            *error_out = error;
+            *error_out = error == ERROR_NO_MORE_FILES ? ERROR_SUCCESS : error;
         }
-        return false;
+        return error == ERROR_NO_MORE_FILES;
     }
 
     do {
-        AcModule *module;
-        if (modules->count >= AC_MAX_MODULES) {
-            modules->truncated = true;
+        if (!ac_module_list_push(
+                modules,
+                (uintptr_t)entry.modBaseAddr,
+                (size_t)entry.modBaseSize,
+                entry.szExePath)) {
+            if (!modules->truncated) {
+                CloseHandle(snapshot);
+                if (error_out != NULL) {
+                    *error_out = ERROR_NOT_ENOUGH_MEMORY;
+                }
+                return false;
+            }
             break;
         }
-
-        module = &modules->items[modules->count++];
-        module->base = (uintptr_t)entry.modBaseAddr;
-        module->size = (size_t)entry.modBaseSize;
-        (void)wcsncpy_s(
-            module->path,
-            sizeof(module->path) / sizeof(module->path[0]),
-            entry.szExePath,
-            _TRUNCATE);
     } while (Module32NextW(snapshot, &entry));
 
-    error = GetLastError();
+    error = modules->truncated ? ERROR_NO_MORE_FILES : GetLastError();
     CloseHandle(snapshot);
 
-    if (error != ERROR_NO_MORE_FILES && !modules->truncated) {
+    if (error != ERROR_NO_MORE_FILES) {
         if (error_out != NULL) {
             *error_out = error;
         }
@@ -164,74 +234,383 @@ bool ac_path_is_under(const wchar_t *path, const wchar_t *directory)
            path[directory_length] == L'/';
 }
 
-bool ac_address_range_in_module(
-    const AcModuleList *modules,
-    uintptr_t base,
-    size_t size)
+bool ac_path_is_under_any(
+    const wchar_t *path,
+    const wchar_t **directories,
+    size_t directory_count)
 {
     size_t index;
 
-    if (modules == NULL) {
+    if (path == NULL || directories == NULL) {
         return false;
     }
 
-    for (index = 0; index < modules->count; ++index) {
-        const AcModule *module = &modules->items[index];
-        if (ac_ranges_overlap_or_contain(
-                module->base,
-                module->size,
-                base,
-                size)) {
+    for (index = 0; index < directory_count; ++index) {
+        if (ac_path_is_under(path, directories[index])) {
             return true;
         }
     }
     return false;
 }
 
-static void ac_log_module_signal(
-    AcLogger *logger,
+void ac_policy_init_defaults(AcPolicy *policy)
+{
+    if (policy == NULL) {
+        return;
+    }
+
+    memset(policy, 0, sizeof(*policy));
+    policy->probe_budget_bytes = 4ull * 1024ull * 1024ull;
+    policy->scan_budget_ms = 250u;
+    policy->repeat_interval_ms = 300000u;
+    policy->max_regions = 200000u;
+    policy->hash_unknown_modules = true;
+    policy->probe_region_content = true;
+}
+
+bool ac_context_init(AcContext *context, AcLogger *logger, const AcPolicy *policy)
+{
+    if (context == NULL || logger == NULL || policy == NULL) {
+        return false;
+    }
+
+    memset(context, 0, sizeof(*context));
+    context->logger = logger;
+    context->policy = *policy;
+    ac_module_list_init(&context->modules);
+    ac_range_index_init(&context->module_ranges);
+
+    return ac_dedup_init(&context->dedup, AC_DEDUP_CAPACITY, policy->repeat_interval_ms);
+}
+
+void ac_context_free(AcContext *context)
+{
+    if (context == NULL) {
+        return;
+    }
+    ac_module_list_free(&context->modules);
+    ac_range_index_free(&context->module_ranges);
+    ac_dedup_free(&context->dedup);
+    context->logger = NULL;
+}
+
+bool ac_hash_file(const wchar_t *path, char hex_out[AC_SHA256_HEX_SIZE], uint64_t *size_out)
+{
+    HANDLE file;
+    AcSha256 hash;
+    uint8_t digest[AC_SHA256_DIGEST_SIZE];
+    uint8_t *buffer;
+    uint64_t total = 0;
+    bool ok = true;
+
+    if (path == NULL || hex_out == NULL) {
+        return false;
+    }
+    hex_out[0] = '\0';
+    if (size_out != NULL) {
+        *size_out = 0;
+    }
+
+    file = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    buffer = (uint8_t *)malloc(AC_FILE_HASH_CHUNK);
+    if (buffer == NULL) {
+        CloseHandle(file);
+        return false;
+    }
+
+    ac_sha256_init(&hash);
+    for (;;) {
+        DWORD read_bytes = 0;
+
+        if (!ReadFile(file, buffer, AC_FILE_HASH_CHUNK, &read_bytes, NULL)) {
+            ok = false;
+            break;
+        }
+        if (read_bytes == 0) {
+            break;
+        }
+
+        ac_sha256_update(&hash, buffer, (size_t)read_bytes);
+        total += read_bytes;
+        if (total > AC_FILE_HASH_LIMIT) {
+            ok = false;
+            break;
+        }
+    }
+
+    free(buffer);
+    CloseHandle(file);
+
+    if (!ok) {
+        return false;
+    }
+
+    ac_sha256_final(&hash, digest);
+    ac_sha256_to_hex(digest, hex_out);
+    if (size_out != NULL) {
+        *size_out = total;
+    }
+    return true;
+}
+
+static void ac_report_module(
+    AcContext *context,
     DWORD pid,
     uint64_t scan_id,
-    const AcModule *module)
+    const AcModule *module,
+    AcScanStats *stats)
 {
+    AcDedupDecision decision;
     char path_utf8[MAX_PATH * 3];
     char escaped_path[MAX_PATH * 6];
-    char details[2048];
+    char file_hash[AC_SHA256_HEX_SIZE];
+    char details[MAX_PATH * 6 + 512];
+    uint64_t fingerprint;
+    uint64_t file_size = 0;
+    bool hashed = false;
 
     if (!ac_wide_to_utf8(module->path, path_utf8, sizeof(path_utf8))) {
         (void)strcpy_s(path_utf8, sizeof(path_utf8), "<path-conversion-failed>");
     }
-    ac_json_escape(path_utf8, escaped_path, sizeof(escaped_path));
+
+    fingerprint = ac_fnv1a64_text(AC_FNV1A64_OFFSET, "module_outside_allowed_roots");
+    fingerprint = ac_fnv1a64_text_ci(fingerprint, path_utf8);
+    ac_dedup_observe(&context->dedup, fingerprint, scan_id, GetTickCount64(), &decision);
+    if (!decision.emit) {
+        ++stats->suppressed;
+        return;
+    }
+
+    file_hash[0] = '\0';
+    if (context->policy.hash_unknown_modules && module->path[0] != L'\0') {
+        hashed = ac_hash_file(module->path, file_hash, &file_size);
+    }
+
+    (void)ac_json_escape(path_utf8, escaped_path, sizeof(escaped_path));
     (void)snprintf(
         details,
         sizeof(details),
-        "{\"scan_id\":%" PRIu64 ",\"path\":\"%s\","
-        "\"base\":\"0x%" PRIxPTR "\",\"size\":%zu,"
-        "\"reason\":\"outside_expected_roots\","
-        "\"verdict\":\"signal_only\"}",
+        "{\"scan_id\":%" PRIu64 ",\"path\":\"%s\",\"base\":\"0x%" PRIxPTR "\","
+        "\"size\":%zu,\"file_sha256\":%s%s%s,\"file_size\":%" PRIu64 ","
+        "\"reason\":\"outside_allowed_roots\",\"verdict\":\"signal_only\","
+        "\"first_seen_scan_id\":%" PRIu64 ",\"occurrences\":%" PRIu64 ","
+        "\"suppressed_since_last_report\":%" PRIu64 "}",
         scan_id,
         escaped_path,
         module->base,
-        module->size);
+        module->size,
+        hashed ? "\"" : "",
+        hashed ? file_hash : "null",
+        hashed ? "\"" : "",
+        file_size,
+        decision.first_scan_id,
+        decision.occurrences,
+        decision.suppressed_since_last_emit);
+
     ac_log_event(
-        logger,
+        context->logger,
         AC_SEVERITY_LOW,
-        "module_outside_expected_roots",
+        "module_outside_allowed_roots",
         pid,
         details);
+    ++stats->emitted;
 }
 
-static bool ac_scan_memory_regions(
-    AcLogger *logger,
+static bool ac_classify_region(
+    const MEMORY_BASIC_INFORMATION *memory,
+    bool backed_by_module,
+    AcRegionFinding *finding)
+{
+    memset(finding, 0, sizeof(*finding));
+    finding->backed_by_module = backed_by_module;
+
+    if (!backed_by_module) {
+        switch (memory->Type) {
+            case MEM_IMAGE:
+                finding->reason = "image_not_in_loader_list";
+                finding->severity = AC_SEVERITY_HIGH;
+                return true;
+            case MEM_MAPPED:
+                finding->reason = "mapped_executable_outside_module";
+                finding->severity = AC_SEVERITY_MEDIUM;
+                return true;
+            case MEM_PRIVATE:
+                finding->reason = ac_is_writable_executable(memory->Protect)
+                    ? "private_writable_executable"
+                    : "private_executable";
+                finding->severity = AC_SEVERITY_MEDIUM;
+                return true;
+            default:
+                finding->reason = "executable_memory_unknown_type";
+                finding->severity = AC_SEVERITY_MEDIUM;
+                return true;
+        }
+    }
+
+    if (ac_is_writable_executable(memory->Protect)) {
+        finding->reason = "writable_executable_inside_module";
+        finding->severity = AC_SEVERITY_LOW;
+        return true;
+    }
+
+    return false;
+}
+
+static void ac_probe_region(
+    AcContext *context,
     HANDLE process,
+    const MEMORY_BASIC_INFORMATION *memory,
+    AcRegionFinding *finding,
+    AcScanStats *stats)
+{
+    SIZE_T requested;
+    SIZE_T read_bytes = 0;
+    uint8_t digest[AC_SHA256_DIGEST_SIZE];
+
+    if (!context->policy.probe_region_content ||
+        stats->probe_bytes >= context->policy.probe_budget_bytes) {
+        return;
+    }
+
+    requested = memory->RegionSize < (SIZE_T)AC_PROBE_BYTES
+        ? memory->RegionSize
+        : (SIZE_T)AC_PROBE_BYTES;
+    if (requested == 0) {
+        return;
+    }
+
+    if (!ReadProcessMemory(
+            process,
+            memory->BaseAddress,
+            context->probe_buffer,
+            requested,
+            &read_bytes)) {
+        if (read_bytes == 0) {
+            ++stats->read_failures;
+            return;
+        }
+    }
+
+    if (read_bytes == 0) {
+        ++stats->read_failures;
+        return;
+    }
+
+    stats->probe_bytes += (uint64_t)read_bytes;
+
+    ac_sha256(context->probe_buffer, (size_t)read_bytes, digest);
+    ac_sha256_to_hex(digest, finding->content_sha256);
+    finding->content_hashed = true;
+
+    if (read_bytes >= 0x40u &&
+        context->probe_buffer[0] == 'M' && context->probe_buffer[1] == 'Z') {
+        const uint32_t pe_offset =
+            (uint32_t)context->probe_buffer[0x3c] |
+            ((uint32_t)context->probe_buffer[0x3d] << 8) |
+            ((uint32_t)context->probe_buffer[0x3e] << 16) |
+            ((uint32_t)context->probe_buffer[0x3f] << 24);
+
+        if ((uint64_t)pe_offset + 6u <= (uint64_t)read_bytes &&
+            context->probe_buffer[pe_offset] == 'P' &&
+            context->probe_buffer[pe_offset + 1u] == 'E' &&
+            context->probe_buffer[pe_offset + 2u] == '\0' &&
+            context->probe_buffer[pe_offset + 3u] == '\0') {
+            finding->pe_header = true;
+            finding->pe_machine = (uint16_t)(
+                (uint32_t)context->probe_buffer[pe_offset + 4u] |
+                ((uint32_t)context->probe_buffer[pe_offset + 5u] << 8));
+        }
+    }
+
+    if (finding->pe_header && !finding->backed_by_module) {
+        finding->severity = AC_SEVERITY_HIGH;
+    }
+}
+
+static void ac_report_region(
+    AcContext *context,
     DWORD pid,
     uint64_t scan_id,
-    const AcModuleList *modules,
+    const MEMORY_BASIC_INFORMATION *memory,
+    const AcRegionFinding *finding,
+    AcScanStats *stats)
+{
+    AcDedupDecision decision;
+    char details[1536];
+    uint64_t fingerprint;
+
+    fingerprint = ac_fnv1a64_text(AC_FNV1A64_OFFSET, "suspicious_executable_region");
+    fingerprint = ac_fnv1a64_text(fingerprint, finding->reason);
+    fingerprint = ac_fnv1a64_continue(fingerprint, &memory->Protect, sizeof(memory->Protect));
+
+    if (finding->pe_header && finding->content_hashed) {
+        fingerprint = ac_fnv1a64_text(fingerprint, finding->content_sha256);
+    } else {
+        const unsigned int bucket = ac_size_bucket((uint64_t)memory->RegionSize);
+        fingerprint = ac_fnv1a64_continue(fingerprint, &bucket, sizeof(bucket));
+    }
+
+    ac_dedup_observe(&context->dedup, fingerprint, scan_id, GetTickCount64(), &decision);
+    if (!decision.emit) {
+        ++stats->suppressed;
+        return;
+    }
+
+    (void)snprintf(
+        details,
+        sizeof(details),
+        "{\"scan_id\":%" PRIu64 ",\"base\":\"0x%" PRIxPTR "\",\"size\":%zu,"
+        "\"protect\":%lu,\"type\":\"%s\",\"backed_by_loaded_module\":%s,"
+        "\"pe_header\":%s,\"pe_machine\":\"0x%04x\",\"content_sha256_4k\":%s%s%s,"
+        "\"reason\":\"%s\",\"verdict\":\"signal_only\","
+        "\"first_seen_scan_id\":%" PRIu64 ",\"occurrences\":%" PRIu64 ","
+        "\"suppressed_since_last_report\":%" PRIu64 "}",
+        scan_id,
+        (uintptr_t)memory->BaseAddress,
+        (size_t)memory->RegionSize,
+        (unsigned long)memory->Protect,
+        ac_memory_type_name(memory->Type),
+        finding->backed_by_module ? "true" : "false",
+        finding->pe_header ? "true" : "false",
+        (unsigned int)finding->pe_machine,
+        finding->content_hashed ? "\"" : "",
+        finding->content_hashed ? finding->content_sha256 : "null",
+        finding->content_hashed ? "\"" : "",
+        finding->reason,
+        decision.first_scan_id,
+        decision.occurrences,
+        decision.suppressed_since_last_emit);
+
+    ac_log_event(
+        context->logger,
+        finding->severity,
+        "suspicious_executable_region",
+        pid,
+        details);
+    ++stats->emitted;
+}
+
+static void ac_scan_memory_regions(
+    AcContext *context,
+    const AcTarget *target,
+    uint64_t scan_id,
     AcScanStats *stats)
 {
     SYSTEM_INFO system_info;
     uintptr_t address;
     uintptr_t maximum_address;
+    size_t region_events = 0;
 
     GetNativeSystemInfo(&system_info);
     address = (uintptr_t)system_info.lpMinimumApplicationAddress;
@@ -239,19 +618,18 @@ static bool ac_scan_memory_regions(
 
     while (address < maximum_address) {
         MEMORY_BASIC_INFORMATION memory;
-        SIZE_T query_size;
         uintptr_t next_address;
 
+        if (stats->regions_visited >= context->policy.max_regions) {
+            break;
+        }
+
         memset(&memory, 0, sizeof(memory));
-        query_size = VirtualQueryEx(
-            process,
-            (LPCVOID)address,
-            &memory,
-            sizeof(memory));
-        if (query_size == 0) {
+        if (VirtualQueryEx(target->process, (LPCVOID)address, &memory, sizeof(memory)) == 0) {
             const DWORD error = GetLastError();
+
             ++stats->query_failures;
-            if (error == ERROR_INVALID_PARAMETER) {
+            if (error == ERROR_INVALID_PARAMETER || error == ERROR_ACCESS_DENIED) {
                 break;
             }
             next_address = address + system_info.dwPageSize;
@@ -262,10 +640,12 @@ static bool ac_scan_memory_regions(
             continue;
         }
 
-        if (memory.RegionSize > UINTPTR_MAX - (uintptr_t)memory.BaseAddress) {
+        ++stats->regions_visited;
+
+        if ((uintptr_t)memory.RegionSize > UINTPTR_MAX - (uintptr_t)memory.BaseAddress) {
             break;
         }
-        next_address = (uintptr_t)memory.BaseAddress + memory.RegionSize;
+        next_address = (uintptr_t)memory.BaseAddress + (uintptr_t)memory.RegionSize;
         if (next_address <= address) {
             break;
         }
@@ -273,125 +653,130 @@ static bool ac_scan_memory_regions(
         if (memory.State == MEM_COMMIT &&
             (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0 &&
             ac_is_executable_protection(memory.Protect)) {
-            bool outside_module;
-            bool suspicious;
+            AcRegionFinding finding;
+            const bool backed = ac_range_index_contains(
+                &context->module_ranges,
+                (uintptr_t)memory.BaseAddress,
+                (size_t)memory.RegionSize);
 
             ++stats->executable_region_count;
-            outside_module = !ac_address_range_in_module(
-                modules,
-                (uintptr_t)memory.BaseAddress,
-                memory.RegionSize);
-            suspicious = outside_module &&
-                         (memory.Type == MEM_PRIVATE ||
-                          ac_is_writable_executable(memory.Protect));
 
-            if (suspicious) {
-                char details[1024];
-                const AcSeverity severity =
-                    ac_is_writable_executable(memory.Protect)
-                        ? AC_SEVERITY_MEDIUM
-                        : AC_SEVERITY_LOW;
-
+            if (ac_classify_region(&memory, backed, &finding)) {
                 ++stats->suspicious_region_count;
-                (void)snprintf(
-                    details,
-                    sizeof(details),
-                    "{\"scan_id\":%" PRIu64 ",\"base\":\"0x%" PRIxPTR
-                    "\",\"size\":%zu,\"protect\":%lu,\"type\":\"%s\","
-                    "\"outside_known_module\":true,"
-                    "\"reason\":\"executable_non_image_memory\","
-                    "\"verdict\":\"signal_only\"}",
-                    scan_id,
-                    (uintptr_t)memory.BaseAddress,
-                    (size_t)memory.RegionSize,
-                    (unsigned long)memory.Protect,
-                    ac_memory_type_name(memory.Type));
-                ac_log_event(
-                    logger,
-                    severity,
-                    "suspicious_executable_region",
-                    pid,
-                    details);
+
+                if (region_events < AC_MAX_REGION_EVENTS_PER_SCAN) {
+                    ac_probe_region(context, target->process, &memory, &finding, stats);
+                    ac_report_region(context, target->pid, scan_id, &memory, &finding, stats);
+                    ++region_events;
+                }
             }
         }
 
         address = next_address;
     }
-
-    return true;
 }
 
 bool ac_scan_process(
-    AcLogger *logger,
-    HANDLE process,
-    DWORD pid,
-    const wchar_t *game_directory,
-    const wchar_t *windows_directory,
+    AcContext *context,
+    const AcTarget *target,
     uint64_t scan_id,
     AcScanStats *stats_out)
 {
-    AcModuleList *modules;
     AcScanStats stats;
-    DWORD error;
+    DWORD error = ERROR_SUCCESS;
+    ULONGLONG started_ms;
     size_t index;
     char details[1024];
 
-    if (logger == NULL || process == NULL || stats_out == NULL) {
+    if (context == NULL || target == NULL || target->process == NULL || stats_out == NULL) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
 
     memset(&stats, 0, sizeof(stats));
-    modules = (AcModuleList *)calloc(1, sizeof(*modules));
-    if (modules == NULL) {
-        SetLastError(ERROR_OUTOFMEMORY);
-        return false;
-    }
+    started_ms = GetTickCount64();
 
-    if (!ac_collect_modules(pid, modules, &error)) {
-        free(modules);
+    if (!ac_collect_modules(target->pid, &context->modules, &error)) {
         SetLastError(error);
         return false;
     }
 
-    stats.module_count = modules->count;
-    for (index = 0; index < modules->count; ++index) {
-        const AcModule *module = &modules->items[index];
-        const bool expected =
-            ac_path_is_under(module->path, game_directory) ||
-            ac_path_is_under(module->path, windows_directory);
+    ac_range_index_clear(&context->module_ranges);
+    for (index = 0; index < context->modules.count; ++index) {
+        (void)ac_range_index_add(
+            &context->module_ranges,
+            context->modules.items[index].base,
+            context->modules.items[index].size);
+    }
+    ac_range_index_finalize(&context->module_ranges);
 
-        if (!expected) {
-            ++stats.outside_expected_roots;
-            ac_log_module_signal(logger, pid, scan_id, module);
+    stats.module_count = context->modules.count;
+    for (index = 0; index < context->modules.count; ++index) {
+        const AcModule *module = &context->modules.items[index];
+
+        if (ac_path_is_under_any(
+                module->path,
+                context->policy.allow_roots,
+                context->policy.allow_root_count)) {
+            continue;
         }
+
+        ++stats.modules_outside_roots;
+        ac_report_module(context, target->pid, scan_id, module, &stats);
     }
 
-    (void)ac_scan_memory_regions(
-        logger,
-        process,
-        pid,
-        scan_id,
-        modules,
-        &stats);
+    ac_scan_memory_regions(context, target, scan_id, &stats);
+
+    stats.duration_ms = (uint64_t)(GetTickCount64() - started_ms);
+    ++context->scans_completed;
 
     (void)snprintf(
         details,
         sizeof(details),
-        "{\"scan_id\":%" PRIu64 ",\"modules\":%zu,"
-        "\"module_list_truncated\":%s,\"outside_expected_roots\":%zu,"
-        "\"executable_regions\":%zu,\"suspicious_regions\":%zu,"
-        "\"query_failures\":%zu}",
+        "{\"scan_id\":%" PRIu64 ",\"duration_ms\":%" PRIu64 ",\"modules\":%zu,"
+        "\"module_list_truncated\":%s,\"modules_outside_allowed_roots\":%zu,"
+        "\"regions_visited\":%zu,\"executable_regions\":%zu,"
+        "\"suspicious_regions\":%zu,\"query_failures\":%zu,\"read_failures\":%zu,"
+        "\"probe_bytes\":%" PRIu64 ",\"events_emitted\":%" PRIu64 ","
+        "\"events_suppressed\":%" PRIu64 ",\"dedup_entries\":%zu,"
+        "\"dedup_saturated_events\":%" PRIu64 "}",
         scan_id,
+        stats.duration_ms,
         stats.module_count,
-        modules->truncated ? "true" : "false",
-        stats.outside_expected_roots,
+        context->modules.truncated ? "true" : "false",
+        stats.modules_outside_roots,
+        stats.regions_visited,
         stats.executable_region_count,
         stats.suspicious_region_count,
-        stats.query_failures);
-    ac_log_event(logger, AC_SEVERITY_INFO, "scan_completed", pid, details);
+        stats.query_failures,
+        stats.read_failures,
+        stats.probe_bytes,
+        stats.emitted,
+        stats.suppressed,
+        context->dedup.used,
+        context->dedup.saturated_events);
+    ac_log_event(context->logger, AC_SEVERITY_INFO, "scan_completed", target->pid, details);
+
+    if (context->policy.scan_budget_ms > 0 &&
+        stats.duration_ms > context->policy.scan_budget_ms) {
+        ++context->perf_budget_breaches;
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"scan_id\":%" PRIu64 ",\"duration_ms\":%" PRIu64 ",\"budget_ms\":%" PRIu64
+            ",\"breaches\":%" PRIu64 "}",
+            scan_id,
+            stats.duration_ms,
+            context->policy.scan_budget_ms,
+            context->perf_budget_breaches);
+        ac_log_event(
+            context->logger,
+            AC_SEVERITY_LOW,
+            "scan_budget_exceeded",
+            target->pid,
+            details);
+    }
 
     *stats_out = stats;
-    free(modules);
     return true;
 }

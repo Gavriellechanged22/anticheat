@@ -1,14 +1,23 @@
 #include "ac.h"
 
+#include <stdlib.h>
+#include <string.h>
 #include <tlhelp32.h>
 #include <wchar.h>
 
-bool ac_find_process_by_name(const wchar_t *name, DWORD *pid_out)
+bool ac_find_process_by_name(
+    const wchar_t *name,
+    DWORD *pid_out,
+    size_t *match_count_out)
 {
     HANDLE snapshot;
     PROCESSENTRY32W entry;
-    bool found = false;
+    size_t matches = 0;
+    DWORD first_match = 0;
 
+    if (match_count_out != NULL) {
+        *match_count_out = 0;
+    }
     if (name == NULL || pid_out == NULL) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
@@ -19,6 +28,7 @@ bool ac_find_process_by_name(const wchar_t *name, DWORD *pid_out)
         return false;
     }
 
+    memset(&entry, 0, sizeof(entry));
     entry.dwSize = sizeof(entry);
     if (!Process32FirstW(snapshot, &entry)) {
         const DWORD error = GetLastError();
@@ -29,80 +39,192 @@ bool ac_find_process_by_name(const wchar_t *name, DWORD *pid_out)
 
     do {
         if (_wcsicmp(entry.szExeFile, name) == 0) {
-            *pid_out = entry.th32ProcessID;
-            found = true;
-            break;
+            if (matches == 0) {
+                first_match = entry.th32ProcessID;
+            }
+            ++matches;
         }
     } while (Process32NextW(snapshot, &entry));
 
     CloseHandle(snapshot);
-    if (!found) {
+
+    if (match_count_out != NULL) {
+        *match_count_out = matches;
+    }
+    if (matches == 0) {
         SetLastError(ERROR_NOT_FOUND);
-    }
-    return found;
-}
-
-HANDLE ac_open_process_for_scan(DWORD pid)
-{
-    return OpenProcess(
-        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-        FALSE,
-        pid);
-}
-
-bool ac_get_process_path(HANDLE process, wchar_t *path_out, size_t path_capacity)
-{
-    DWORD capacity;
-
-    if (process == NULL || path_out == NULL || path_capacity == 0 ||
-        path_capacity > MAXDWORD) {
-        SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
 
-    capacity = (DWORD)path_capacity;
-    if (!QueryFullProcessImageNameW(process, 0, path_out, &capacity)) {
-        return false;
-    }
-
-    path_out[path_capacity - 1] = L'\0';
+    *pid_out = first_match;
     return true;
 }
 
-bool ac_get_parent_directory(
-    const wchar_t *path,
-    wchar_t *directory_out,
-    size_t directory_capacity)
+static bool ac_process_supports_query(HANDLE process)
 {
-    wchar_t *separator;
-    size_t length;
+    MEMORY_BASIC_INFORMATION memory;
 
-    if (path == NULL || directory_out == NULL || directory_capacity == 0) {
+    memset(&memory, 0, sizeof(memory));
+    if (VirtualQueryEx(process, NULL, &memory, sizeof(memory)) != 0) {
+        return true;
+    }
+    return GetLastError() != ERROR_ACCESS_DENIED;
+}
+
+HANDLE ac_open_process_for_scan(DWORD pid, DWORD *granted_access_out)
+{
+    static const DWORD access_levels[] = {
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE,
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE
+    };
+    size_t index;
+    DWORD last_error = ERROR_ACCESS_DENIED;
+
+    if (granted_access_out != NULL) {
+        *granted_access_out = 0;
+    }
+
+    for (index = 0; index < sizeof(access_levels) / sizeof(access_levels[0]); ++index) {
+        HANDLE process = OpenProcess(access_levels[index], FALSE, pid);
+
+        if (process == NULL) {
+            last_error = GetLastError();
+            continue;
+        }
+
+        if (!ac_process_supports_query(process)) {
+            CloseHandle(process);
+            last_error = ERROR_ACCESS_DENIED;
+            continue;
+        }
+
+        if (granted_access_out != NULL) {
+            *granted_access_out = access_levels[index];
+        }
+        return process;
+    }
+
+    SetLastError(last_error);
+    return NULL;
+}
+
+bool ac_get_process_path(HANDLE process, wchar_t **path_out)
+{
+    DWORD capacity = MAX_PATH;
+
+    if (process == NULL || path_out == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    *path_out = NULL;
+
+    while (capacity <= 32768u) {
+        DWORD length = capacity;
+        wchar_t *buffer = (wchar_t *)malloc((size_t)capacity * sizeof(wchar_t));
+
+        if (buffer == NULL) {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return false;
+        }
+
+        if (QueryFullProcessImageNameW(process, 0, buffer, &length)) {
+            buffer[length < capacity ? length : capacity - 1u] = L'\0';
+            *path_out = buffer;
+            return true;
+        }
+
+        free(buffer);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            return false;
+        }
+        capacity *= 2u;
+    }
+
+    SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    return false;
+}
+
+bool ac_get_process_start_time(HANDLE process, uint64_t *start_time_out)
+{
+    FILETIME creation;
+    FILETIME exit_time;
+    FILETIME kernel_time;
+    FILETIME user_time;
+    ULARGE_INTEGER value;
+
+    if (process == NULL || start_time_out == NULL) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
 
-    length = wcslen(path);
-    if (length + 1 > directory_capacity) {
-        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    if (!GetProcessTimes(process, &creation, &exit_time, &kernel_time, &user_time)) {
         return false;
     }
 
-    (void)wcscpy_s(directory_out, directory_capacity, path);
-    separator = wcsrchr(directory_out, L'\\');
-    if (separator == NULL) {
-        separator = wcsrchr(directory_out, L'/');
-    }
+    value.LowPart = creation.dwLowDateTime;
+    value.HighPart = creation.dwHighDateTime;
+    *start_time_out = (uint64_t)value.QuadPart;
+    return true;
+}
 
+bool ac_get_parent_directory(const wchar_t *path, wchar_t **directory_out)
+{
+    wchar_t *buffer;
+    wchar_t *separator;
+    size_t length;
+
+    if (path == NULL || directory_out == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    *directory_out = NULL;
+
+    length = wcslen(path);
+    buffer = (wchar_t *)malloc((length + 1u) * sizeof(wchar_t));
+    if (buffer == NULL) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+    (void)wcscpy_s(buffer, length + 1u, path);
+
+    separator = wcsrchr(buffer, L'\\');
     if (separator == NULL) {
+        separator = wcsrchr(buffer, L'/');
+    }
+    if (separator == NULL) {
+        free(buffer);
         SetLastError(ERROR_BAD_PATHNAME);
         return false;
     }
 
-    if (separator == directory_out + 2 && directory_out[1] == L':') {
+    if (separator == buffer + 2u && buffer[1] == L':') {
         separator[1] = L'\0';
     } else {
         *separator = L'\0';
     }
+
+    *directory_out = buffer;
     return true;
+}
+
+bool ac_process_image_matches_name(const wchar_t *image_path, const wchar_t *name)
+{
+    const wchar_t *base;
+    const wchar_t *separator;
+
+    if (image_path == NULL || name == NULL) {
+        return false;
+    }
+
+    base = image_path;
+    separator = wcsrchr(image_path, L'\\');
+    if (separator != NULL) {
+        base = separator + 1;
+    }
+    separator = wcsrchr(base, L'/');
+    if (separator != NULL) {
+        base = separator + 1;
+    }
+
+    return _wcsicmp(base, name) == 0;
 }
