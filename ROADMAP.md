@@ -1,220 +1,256 @@
-# Дорожная карта
+# Technical Roadmap
 
-Что нужно, чтобы проект перестал быть «прототипом с хорошим README» и начал
-продавать себя сам.
+This roadmap defines engineering work required to move the current telemetry
+implementation from development status to a deployable Windows component.
 
-## Принцип
+## Current baseline
 
-Продукт в этой области продаёт не список фич, а **проверяемые утверждения**:
+Implemented:
 
-1. «Мы ловим вот эти техники» — подтверждено корпусом тестов, а не рассказом.
-2. «Мы стоим вот столько» — подтверждено цифрами на конкретном железе.
-3. «Мы ошибаемся вот настолько редко» — подтверждено измеренным FP rate.
-4. «Интеграция занимает вот столько» — подтверждено работающим примером
-   коллектора и SDK.
+- x64 WDM telemetry driver source;
+- restricted, exclusive device object;
+- process and image-load callbacks;
+- one-PID target filter;
+- bounded kernel event queue with dropped-event accounting;
+- versioned fixed-size IOCTL protocol;
+- user-mode kernel-event client;
+- x64 and Win32 user-mode process scanner;
+- loader/module and executable-memory correlation;
+- content and file hashing under explicit budgets;
+- event de-duplication;
+- JSONL rotation and SHA-256 integrity chain;
+- portable unit tests and Windows integration tests.
 
-Каждый этап ниже заканчивается критерием приёмки, который можно показать
-человеку, принимающему решение о внедрении. Этап без критерия — не этап.
+Not yet completed:
 
----
+- production driver package signing;
+- WDK CI build;
+- Driver Verifier and HLK validation;
+- KMDF migration evaluation;
+- signed application manifest;
+- server transport and collector reference implementation;
+- measured compatibility and false-positive datasets.
 
-## Этап 0 — сделано
+## Milestone 1: kernel build and verification pipeline
 
-Наблюдающий сенсор с фиксированными свойствами: только чтение, отсутствие
-реакций, JSONL с цепочкой хешей, подавление повторов, бюджет
-производительности, документированная схема событий, CI на x64/x86 со сквозным
-сканом и проверкой журнала, портируемое ядро под санитайзерами.
+Deliverables:
 
-Этого достаточно, чтобы **начать собирать данные**, и недостаточно, чтобы
-кому-то что-то доказать. Дальше — про доказательства.
+- WDK-based CI image with a pinned SDK/WDK version;
+- `msbuild` of `driver/AcTelemetry.vcxproj`;
+- `InfVerif` validation of `driver/AcTelemetry.inf`;
+- test catalog generation;
+- static driver analysis;
+- CodeQL or equivalent analysis for user-mode code;
+- published unsigned development artifacts with SHA-256 checksums;
+- symbol artifact retention.
 
----
+Acceptance criteria:
 
-## Этап 1 — корпус техник инъекции
+- Release x64 driver builds without warnings;
+- shared ABI compile-time assertions pass in driver and collector builds;
+- INF validation passes;
+- user-mode x64 and Win32 matrices remain green;
+- protocol compatibility test covers version, structure size, and malformed
+  requests.
 
-**Это самый важный этап, и он не про новый код детектора.**
+## Milestone 2: kernel reliability validation
 
-Пока нет корпуса, любое утверждение об обнаружении — маркетинг. Нужен
-репозиторий-полигон `tests/corpus/` с целевым приложением и набором инжекторов,
-каждый из которых реализует одну известную технику:
+Deliverables:
 
-| Техника | Ожидаемый сигнал |
-| --- | --- |
-| `LoadLibrary` через `CreateRemoteThread` | `module_outside_allowed_roots` |
-| Ручной маппинг PE (manual map) | `private_executable` + `pe_header:true` |
-| Manual map с очисткой заголовков | `private_executable`, `pe_header:false` |
-| Отвязка от списка загрузчика (unlink) | `image_not_in_loader_list` |
-| Маппинг через section object | `mapped_executable_outside_module` |
-| RWX-шелл-код без PE | `private_writable_executable` |
-| Process hollowing | несоответствие пути образа |
-| Патч `.text` загруженного модуля | **не обнаруживается — нужен этап 2** |
-| Хук через IAT/EAT | **не обнаруживается — нужен этап 2** |
-| Инъекция до старта сенсора | **не обнаруживается — нужен этап 4** |
+- Driver Verifier configuration for Special Pool, Force IRQL Checking, I/O
+  Verification, Deadlock Detection, Security Checks, and DDI compliance;
+- concurrent open, target-change, read, process-exit, and unload tests;
+- queue saturation and wraparound tests;
+- repeated load/unload test;
+- crash-dump triage procedure;
+- kernel code coverage for dispatch and callback paths;
+- ETW or WPP diagnostics that do not expose target memory.
 
-Полигон запускается в CI (Windows runner, изолированный процесс-цель) и
-формирует матрицу «техника × результат», которая публикуется в README.
+Acceptance criteria:
 
-**Критерий приёмки:** таблица покрытия генерируется автоматически, красные
-клетки в ней присутствуют и честно подписаны. Проект, который показывает свои
-дыры, продаётся лучше, чем проект, который заявляет 100 %.
+- 24-hour stress test completes without bugcheck or verifier finding;
+- queue counters remain internally consistent under concurrent callbacks;
+- callback removal completes before device deletion;
+- malformed IOCTL corpus produces only documented NTSTATUS responses;
+- nonpaged allocation remains fixed after driver initialization.
 
-**Оценка:** 2–3 недели. **Зависимости:** нет — можно начинать сразу.
+## Milestone 3: package, signing, and lifecycle
 
----
+Deliverables:
 
-## Этап 2 — подписанный манифест и PE-aware целостность
+- production INF and catalog generation;
+- release-signing pipeline using an external protected signing service;
+- installer integration;
+- service start, stop, upgrade, rollback, and uninstall operations;
+- version compatibility matrix between driver and collector;
+- safe behavior when a newer or older peer is installed;
+- reboot-required state reporting.
 
-Сейчас доверие определяется каталогом, а это эвристика. Замена:
+Acceptance criteria:
 
-* **Манифест сборки.** Подписанный (Ed25519) документ для конкретной версии
-  приложения: пути, размеры, SHA-256 файлов, разрешённые издатели, ожидаемые
-  модули. Агент грузит манифест, проверяет подпись и переходит от «файл лежит
-  в нужной папке» к «файл именно тот».
-* **Проверка Authenticode.** `WinVerifyTrust` для модулей вне манифеста плюс
-  извлечение издателя. Неизвестный неподписанный модуль и неизвестный модуль
-  от известного вендора — разные сигналы.
-* **Целостность секций PE.** Разбор заголовков, хеширование исполняемых секций
-  блоками с нормализацией релокаций, импортов и delay-load. Сообщать точный RVA
-  изменившегося блока, а не «хеш .text не сошёлся».
-* **Проверка IAT/EAT** относительно манифеста.
+- clean installation and uninstall pass on every supported Windows release;
+- an in-use driver upgrade follows a documented restart or reboot path;
+- collector refuses incompatible protocol versions;
+- signing keys are never present in source control or CI job files;
+- package hashes and symbols are retained for each release.
 
-Это закрывает две красные клетки корпуса и переводит `module_outside_allowed_roots`
-из `low` в осмысленный сигнал.
+## Milestone 4: target-session registration
 
-**Критерий приёмки:** патч одной инструкции в `.text` загруженного модуля даёт
-событие с точным RVA; легитимный hotpatch и DRM не дают событий на трёх реальных
-приложениях.
+The current protocol registers a PID after the process exists. Image mappings
+that occur before registration are not replayed.
 
-**Оценка:** 4–6 недель. **Зависимости:** этап 1 (иначе нечем проверить).
+Deliverables:
 
----
+- launcher integration API;
+- create-suspended launch sequence;
+- server-issued session identifier;
+- target PID plus process creation-time identity;
+- explicit target-clear operation during teardown;
+- optional process-start policy based on a signed expected image identity;
+- no system-wide event export.
 
-## Этап 3 — корреляция и версионируемые правила
+Acceptance criteria:
 
-Сейчас severity зашита в код. Нужен слой политики:
+- launcher registers the target before resuming its initial thread;
+- PID reuse cannot associate events with an earlier session;
+- target exit closes the active session deterministically;
+- a second client cannot replace the active target;
+- all target transitions are represented in the event stream.
 
-* **Правила как данные.** Версионированный, подписанный набор правил
-  (`rules_version` в каждом событии), обновляемый без пересборки агента.
-* **Скоринг с затуханием.** Не «сигнал = вердикт», а накопление: неизвестный
-  модуль — слабый вклад; PE-образ в приватной памяти — сильный; поток,
-  исполняющийся в таком регионе, вместе с несовпадением блока кода — сильная
-  корреляция.
-* **Audit mode по умолчанию.** Новое правило не влияет на score, пока не
-  отработало N сессий и не показало FP rate ниже порога.
-* **Дедупликация между запусками.** Сейчас таблица подавления живёт в памяти
-  процесса; нужно переживать перезапуск.
+## Milestone 5: signed application manifest
 
-**Критерий приёмки:** новое правило добавляется файлом и попадает в прод без
-пересборки; отчёт по каждому правилу показывает срабатывания и FP rate.
+Deliverables:
 
-**Оценка:** 3–4 недели. **Зависимости:** этапы 1–2.
+- signed manifest containing expected executable and module identities;
+- application build ID;
+- expected path, file size, and SHA-256 per file;
+- optional Authenticode publisher constraints;
+- manifest key rotation;
+- offline signature verification;
+- explicit manifest version in every session.
 
----
+Acceptance criteria:
 
-## Этап 4 — сервер, доставка и якорь доверия
+- collector rejects a manifest with an invalid signature;
+- expected modules are classified by cryptographic identity rather than
+  directory alone;
+- manifest updates do not require collector or driver recompilation;
+- rollback to an expired manifest is detected.
 
-Пока журнал лежит на машине наблюдаемого, он не доказательство.
+## Milestone 6: PE-aware integrity
 
-* **Протокол доставки.** Батчи событий по TLS, идемпотентность по `seq`,
-  устойчивость к офлайну, ограничение объёма.
-* **Якорение цепочки.** Голова цепочки хешей регулярно уходит на сервер. После
-  этого удаление или переписывание журнала становится **обнаруживаемым**, а не
-  просто «нечестным». Это превращает tamper-evident в практическую
-  tamper-resistance.
-* **Эталонный коллектор.** Открытая реализация приёмника: валидация цепочки,
-  хранение, разбор схемы, готовые дашборды. Интеграция должна занимать день,
-  а не квартал.
-* **Обнаружение молчания.** Отсутствие `scan_completed` — сигнал. Сервер должен
-  считать его наравне с находками.
-* **Ранний старт.** Запуск сенсора лаунчером до основного процесса закрывает
-  сценарий «чит появился раньше наблюдателя».
+Deliverables:
 
-**Критерий приёмки:** демонстрация, в которой удаление строки из журнала
-детектируется сервером; коллектор поднимается одной командой.
+- PE parser with strict bounds validation;
+- executable-section block hashes;
+- relocation, import, delay-load, and supported hotpatch normalization;
+- IAT and EAT target validation;
+- exact RVA and expected/observed hash in integrity events;
+- CPU and I/O budgets per scan.
 
-**Оценка:** 4–6 недель. **Зависимости:** этап 1.
+Acceptance criteria:
 
----
+- a one-instruction `.text` modification produces an event with the exact
+  affected RVA;
+- supported relocations and import resolution do not generate findings;
+- malformed PE inputs do not crash or exceed configured resource limits;
+- integrity scanning remains outside kernel callbacks.
 
-## Этап 5 — эксплуатационная зрелость
+## Milestone 7: event transport and remote verification
 
-* **Служба Windows с watchdog и heartbeat.** Останов сенсора становится
-  наблюдаемым событием.
-* **Самопроверка.** Агент проверяет собственную подпись и подпись конфигурации,
-  сообщает о несоответствии.
-* **Подписанные релизы.** Code signing бинарей, воспроизводимая сборка,
-  публикация хешей.
-* **Телеметрия здоровья.** Счётчики отказов записи, переполнения таблицы,
-  превышения бюджета — уже пишутся, нужен их разбор на сервере.
-* **Приватность.** Явный список собираемых полей, режим минимизации (только
-  хеши без путей), политика хранения, документ для DPO. Для рынка ЕС и для
-  прокторинга это блокирующее требование, а не «потом».
+Deliverables:
 
-**Критерий приёмки:** MSI-установщик, подписанные бинари, документ по
-обрабатываемым данным, проходящий ревью юриста.
+- authenticated TLS transport;
+- server-issued session ID;
+- idempotent batch protocol keyed by session and sequence;
+- offline spool with size and age limits;
+- remote chain-head anchoring;
+- reference receiver;
+- schema compatibility policy;
+- backpressure and retry policy.
 
-**Оценка:** 3–4 недели. **Зависимости:** этапы 3–4.
+Acceptance criteria:
 
----
+- duplicate batches are accepted idempotently;
+- missing or reordered sequences are detected;
+- local record modification is detected after remote anchoring;
+- collector remains within spool limits while offline;
+- transport failure does not block kernel callbacks or the target process.
 
-## Этап 6 — упаковка в продукт
+## Milestone 8: rule and correlation service
 
-* **Библиотечный режим.** `anticheat.dll` / статическая библиотека с C API,
-  чтобы сенсор встраивался в лаунчер, а не запускался рядом.
-* **SDK и примеры.** Готовые интеграции: Unreal, Unity, Electron-клиент
-  прокторинга.
-* **Опубликованные бенчмарки.** `duration_ms` p50/p95, потребление CPU и I/O на
-  трёх типовых конфигурациях, воспроизводимо.
-* **Матрица покрытия из этапа 1 на видном месте.**
-* **Сравнение с альтернативами** с честными оговорками.
+Deliverables:
 
-**Критерий приёмки:** сторонний разработчик интегрирует сенсор и получает
-события на своём сервере за один рабочий день, пользуясь только документацией.
+- versioned server-side rules;
+- audit-only rollout mode;
+- correlation across kernel events, user-mode scans, application identity, and
+  session state;
+- per-rule false-positive metrics;
+- rule rollback;
+- decision audit record.
 
----
+Acceptance criteria:
 
-## Что мы не будем делать
+- client binaries contain no account-enforcement policy;
+- every decision references input event IDs and rule version;
+- new rules remain non-enforcing until configured acceptance thresholds are
+  met;
+- unknown client events are retained without breaking ingestion.
 
-Отказ от этого — часть позиционирования, а не отсутствие ресурсов.
+## Milestone 9: compatibility and performance qualification
 
-* **Драйвер ядра.** Другой продукт, другая цена, другие требования к подписи.
-  Если он вам нужен — этот проект не заменит его и не притворяется заменой.
-* **Автоматические баны в агенте.** Решение — на сервере, с апелляцией.
-* **Сканирование всей системы.** Плохая граница приватности, конфликты с
-  защитным ПО, тривиальный обход переименованием.
-* **Недокументированные API как основание для санкции.** `NtQueryInformationThread`
-  и чтение PEB допустимы как слабая телеметрия за адаптером с проверкой версии
-  ОС и поведением fail-open, но не как доказательство.
-* **Гонка обфускации с читерами.** Скрытность в ring 3 покупается дорого и
-  ломается дёшево. Мы вкладываемся в качество данных.
+Test matrix:
 
----
+- supported Windows client builds;
+- supported CPU architectures;
+- Hyper-V and VBS/HVCI configurations;
+- common GPU, overlay, accessibility, and endpoint-security software;
+- high-module-count and high-image-load workloads;
+- application startup, update, and shutdown paths.
 
-## Метрики, по которым судить
+Required metrics:
 
-| Метрика | Цель |
-| --- | --- |
-| Покрытие корпуса техник | публикуется, растёт от релиза к релизу |
-| FP rate на 1000 сессий | < 0.1 % для severity `high` |
-| `duration_ms` p95 | < 100 мс |
-| Доля CPU при интервале 5 с | < 0.5 % одного ядра |
-| Время до первой интеграции | < 1 рабочего дня |
-| Доля сессий с непрерывной цепочкой | > 99 % |
+- kernel callback duration distribution;
+- queue depth and dropped-event rate;
+- collector CPU p50/p95/p99;
+- user-mode scan duration p50/p95/p99;
+- bytes read from target memory;
+- log throughput and rotation rate;
+- crash-free session rate;
+- finding rate by rule and application build.
 
----
+Acceptance criteria must be defined per supported application and hardware
+class before production rollout.
 
-## Порядок работ
+## Explicit exclusions
 
-Ближайший квартал, по убыванию отдачи на вложенное время:
+The planned kernel component will not include:
 
-1. **Этап 1** — корпус техник. Без него всё остальное недоказуемо.
-2. **Этап 4** — якорение цепочки и коллектор. Превращает журнал в
-   доказательство и даёт интеграторам точку входа.
-3. **Этап 2** — манифест и PE-целостность. Закрывает крупнейшие детекционные
-   дыры.
-4. **Этап 3** — правила как данные. Нужен, когда правил станет больше десятка.
-5. **Этапы 5–6** — когда появятся первые внешние пользователи.
+- SSDT or kernel inline hooks;
+- DKOM or object hiding;
+- arbitrary process or kernel memory IOCTLs;
+- direct client enforcement from callbacks;
+- process termination;
+- unsigned production loading;
+- undocumented kernel structure traversal as a required signal;
+- network operations in kernel mode.
 
-Версионирование: схема событий версионируется отдельно от агента
-(`AC_SCHEMA_VERSION`). Ломающие изменения схемы — только с инкрементом версии
-и переходным периодом, в течение которого коллектор принимает обе.
+Any proposal to add an excluded capability requires a separate design and
+security review.
+
+## Versioning policy
+
+Three versions are independent:
+
+- collector version: `AC_AGENT_VERSION`;
+- JSON event schema: `AC_SCHEMA_VERSION`;
+- kernel IOCTL ABI: `AC_DRIVER_PROTOCOL_VERSION`.
+
+Rules:
+
+- additive event types may remain within one JSON schema version;
+- changes to existing field meaning require a schema increment;
+- any IOCTL structure layout or semantic change requires a protocol increment;
+- incompatible driver and collector versions must fail closed when
+  `--require-kernel` is active;
+- release packages must publish the supported version matrix.

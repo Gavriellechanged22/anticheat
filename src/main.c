@@ -28,6 +28,8 @@ typedef struct AcOptions {
     bool quiet;
     bool skip_module_hashes;
     bool skip_region_probe;
+    bool kernel_telemetry;
+    bool require_kernel;
 } AcOptions;
 
 static HANDLE g_stop_event = NULL;
@@ -78,6 +80,10 @@ static void ac_print_usage(const wchar_t *program)
         L"  --repeat-interval-ms <n>  re-report an identical signal after this (default 300000)\n"
         L"  --no-module-hashes        do not SHA-256 unknown module files\n"
         L"  --no-region-probe         do not read suspicious region content\n"
+        L"\n"
+        L"Kernel telemetry:\n"
+        L"  --kernel                  consume AcTelemetry driver events when available\n"
+        L"  --require-kernel          fail if the driver cannot be opened or configured\n"
         L"\n"
         L"Output:\n"
         L"  --log <file>              JSON Lines output (default anticheat-events.jsonl)\n"
@@ -154,6 +160,11 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
             options->skip_module_hashes = true;
         } else if (wcscmp(argument, L"--no-region-probe") == 0) {
             options->skip_region_probe = true;
+        } else if (wcscmp(argument, L"--kernel") == 0) {
+            options->kernel_telemetry = true;
+        } else if (wcscmp(argument, L"--require-kernel") == 0) {
+            options->kernel_telemetry = true;
+            options->require_kernel = true;
         } else if (wcscmp(argument, L"--process") == 0 && has_value) {
             options->process_name = argv[++index];
         } else if (wcscmp(argument, L"--log") == 0 && has_value) {
@@ -364,6 +375,7 @@ int wmain(int argc, wchar_t **argv)
     AcOptions options;
     AcLogger logger;
     AcContext context;
+    AcKernelClient kernel_client;
     AcPolicy policy;
     AcTarget target;
     const wchar_t *roots[AC_MAX_ALLOW_ROOTS];
@@ -372,13 +384,16 @@ int wmain(int argc, wchar_t **argv)
     wchar_t program_files_x86[MAX_PATH];
     char details[1024];
     uint64_t scan_id = 0;
+    uint64_t kernel_events = 0;
     size_t root_count = 0;
     size_t root_index;
     bool exit_now = false;
     bool context_ready = false;
+    bool kernel_ready = false;
     int exit_code = AC_EXIT_INTERNAL;
 
     memset(&target, 0, sizeof(target));
+    ac_kernel_client_init(&kernel_client);
 
     if (!ac_parse_options(argc, argv, &options, &exit_now)) {
         ac_print_usage(argv[0]);
@@ -409,13 +424,16 @@ int wmain(int argc, wchar_t **argv)
     (void)snprintf(
         details,
         sizeof(details),
-        "{\"agent\":\"%s\",\"version\":\"%s\",\"schema\":%u,\"mode\":\"observe_only\","
+        "{\"agent\":\"%s\",\"version\":\"%s\",\"schema\":%u,\"mode\":\"%s\","
         "\"memory_write_access\":false,\"terminates_target\":false,"
         "\"interval_ms\":%lu,\"once\":%s,\"scan_budget_ms\":%" PRIu64 ","
         "\"repeat_interval_ms\":%" PRIu64 ",\"pointer_bits\":%zu}",
         AC_AGENT_NAME,
         AC_AGENT_VERSION,
         AC_SCHEMA_VERSION,
+        options.kernel_telemetry
+            ? "hybrid_kernel_user_telemetry"
+            : "user_telemetry",
         (unsigned long)options.interval_ms,
         options.once ? "true" : "false",
         options.scan_budget_ms,
@@ -521,6 +539,52 @@ int wmain(int argc, wchar_t **argv)
         ac_log_event(&logger, AC_SEVERITY_INFO, "target_opened", target.pid, target_details);
     }
 
+    if (options.kernel_telemetry) {
+        if (!ac_kernel_client_open(&kernel_client)) {
+            ac_log_win32_error(
+                &logger,
+                "kernel_driver_open_failed",
+                target.pid,
+                GetLastError());
+            if (options.require_kernel) {
+                exit_code = AC_EXIT_ACCESS_DENIED;
+                goto cleanup;
+            }
+        } else if (!ac_kernel_client_set_target(
+                       &kernel_client,
+                       target.pid)) {
+            const DWORD error = GetLastError();
+            ac_log_win32_error(
+                &logger,
+                "kernel_target_registration_failed",
+                target.pid,
+                error);
+            ac_kernel_client_close(&kernel_client);
+            if (options.require_kernel) {
+                exit_code = AC_EXIT_ACCESS_DENIED;
+                goto cleanup;
+            }
+        } else {
+            char kernel_details[512];
+            kernel_ready = true;
+            (void)snprintf(
+                kernel_details,
+                sizeof(kernel_details),
+                "{\"protocol_version\":%u,\"event_size\":%u,"
+                "\"queue_capacity\":%u,\"target_pid\":%lu}",
+                kernel_client.version.protocol_version,
+                kernel_client.version.event_size,
+                kernel_client.version.queue_capacity,
+                (unsigned long)target.pid);
+            ac_log_event(
+                &logger,
+                AC_SEVERITY_INFO,
+                "kernel_driver_connected",
+                target.pid,
+                kernel_details);
+        }
+    }
+
     for (;;) {
         AcScanStats stats;
         HANDLE wait_handles[2];
@@ -529,6 +593,25 @@ int wmain(int argc, wchar_t **argv)
         if (ac_stop_requested()) {
             exit_code = AC_EXIT_OK;
             break;
+        }
+
+        if (kernel_ready &&
+            !ac_kernel_client_drain(
+                &kernel_client,
+                &logger,
+                target.pid,
+                &kernel_events)) {
+            ac_log_win32_error(
+                &logger,
+                "kernel_event_read_failed",
+                target.pid,
+                GetLastError());
+            ac_kernel_client_close(&kernel_client);
+            kernel_ready = false;
+            if (options.require_kernel) {
+                exit_code = AC_EXIT_INTERNAL;
+                break;
+            }
         }
 
         ++scan_id;
@@ -553,6 +636,13 @@ int wmain(int argc, wchar_t **argv)
         wait_result = WaitForMultipleObjects(2u, wait_handles, FALSE, options.interval_ms);
 
         if (wait_result == WAIT_OBJECT_0) {
+            if (kernel_ready) {
+                (void)ac_kernel_client_drain(
+                    &kernel_client,
+                    &logger,
+                    target.pid,
+                    &kernel_events);
+            }
             ac_log_event(&logger, AC_SEVERITY_INFO, "target_exited", target.pid, "{}");
             exit_code = AC_EXIT_OK;
             break;
@@ -572,9 +662,11 @@ cleanup:
         details,
         sizeof(details),
         "{\"scans\":%" PRIu64 ",\"terminated_target\":false,"
+        "\"kernel_events\":%" PRIu64 ","
         "\"log_write_failures\":%" PRIu64 ",\"log_truncated_lines\":%" PRIu64 ","
         "\"exit_code\":%d}",
         scan_id,
+        kernel_events,
         logger.write_failures,
         logger.truncated_lines,
         exit_code);
@@ -582,6 +674,10 @@ cleanup:
 
     if (context_ready) {
         ac_context_free(&context);
+    }
+    if (kernel_ready) {
+        (void)ac_kernel_client_set_target(&kernel_client, 0);
+        ac_kernel_client_close(&kernel_client);
     }
     if (target.process != NULL) {
         CloseHandle(target.process);

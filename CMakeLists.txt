@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(user_mode_anticheat VERSION 0.2.0 LANGUAGES C)
+project(anticheat_telemetry VERSION 0.3.0 LANGUAGES C)
 
 function(ac_enable_warnings target)
     if(MSVC)
@@ -38,10 +38,12 @@ if(NOT WIN32)
 endif()
 
 add_library(anticheat_core STATIC
+    src/kernel_client.c
     src/log.c
     src/process.c
     src/scanner.c
 )
+target_include_directories(anticheat_core PUBLIC src include)
 target_link_libraries(anticheat_core PUBLIC anticheat_portable)
 target_compile_definitions(anticheat_core PUBLIC
     UNICODE

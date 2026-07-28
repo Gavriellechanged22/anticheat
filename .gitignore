@@ -6,3 +6,10 @@
 *.exe
 *.obj
 *.pdb
+*.sys
+*.cat
+*.cer
+*.vcxproj.user
+/driver/x64/
+/driver/Debug/
+/driver/Release/

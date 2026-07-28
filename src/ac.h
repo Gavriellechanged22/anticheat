@@ -7,14 +7,15 @@
 #include <stdio.h>
 #include <windows.h>
 
+#include "ac_driver_protocol.h"
 #include "dedup.h"
 #include "ranges.h"
 #include "sha256.h"
 #include "text.h"
 
-#define AC_AGENT_NAME "user-mode-anticheat"
-#define AC_AGENT_VERSION "0.2.0"
-#define AC_SCHEMA_VERSION 2u
+#define AC_AGENT_NAME "anticheat-collector"
+#define AC_AGENT_VERSION "0.3.0"
+#define AC_SCHEMA_VERSION 3u
 
 #define AC_MAX_MODULES 8192u
 #define AC_MAX_SNAPSHOT_RETRIES 16u
@@ -103,6 +104,12 @@ typedef struct AcTarget {
     wchar_t *directory;
 } AcTarget;
 
+typedef struct AcKernelClient {
+    HANDLE device;
+    AcDriverVersion version;
+    uint64_t last_dropped;
+} AcKernelClient;
+
 bool ac_logger_open(
     AcLogger *logger,
     const wchar_t *path,
@@ -159,5 +166,18 @@ bool ac_hash_file(const wchar_t *path, char hex_out[AC_SHA256_HEX_SIZE], uint64_
 bool ac_wide_to_utf8(const wchar_t *input, char *output, size_t output_capacity);
 bool ac_wide_to_utf8_alloc(const wchar_t *input, char **output);
 const char *ac_severity_name(AcSeverity severity);
+
+void ac_kernel_client_init(AcKernelClient *client);
+bool ac_kernel_client_open(AcKernelClient *client);
+void ac_kernel_client_close(AcKernelClient *client);
+bool ac_kernel_client_set_target(AcKernelClient *client, DWORD pid);
+bool ac_kernel_client_get_stats(
+    AcKernelClient *client,
+    AcDriverStats *stats_out);
+bool ac_kernel_client_drain(
+    AcKernelClient *client,
+    AcLogger *logger,
+    DWORD target_pid,
+    uint64_t *events_out);
 
 #endif

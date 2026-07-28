@@ -1,99 +1,64 @@
-# user-mode-anticheat
+# Anticheat Telemetry
 
-**Сенсор целостности процесса для Windows, показания которого можно защитить
-в споре с пользователем.**
+Anticheat Telemetry is a Windows process-integrity sensor composed of:
 
-![license](https://img.shields.io/badge/license-MIT-blue)
-![language](https://img.shields.io/badge/C-11-green)
-![platform](https://img.shields.io/badge/Windows-x64%20%7C%20x86-informational)
-![mode](https://img.shields.io/badge/mode-observe--only-success)
-![deps](https://img.shields.io/badge/dependencies-0-lightgrey)
+- `AcTelemetry.sys`: optional x64 kernel telemetry driver;
+- `anticheat.exe`: user-mode collector and process-memory scanner;
+- `tools/verify_log.py`: JSONL integrity-chain verifier;
+- a versioned IOCTL protocol in `include/ac_driver_protocol.h`.
 
-Один exe-файл без зависимостей наблюдает за игрой или экзаменационным
-приложением и пишет структурированный поток событий: что загружено в процесс,
-какая исполняемая память не объясняется загрузчиком, что изменилось со времени
-прошлого скана. Он ничего не пишет в чужую память, никого не банит и не
-завершает. Решение принимает ваш сервер — на данных, которые он может
-перепроверить.
+The kernel driver records process lifecycle and image-load notifications for
+one registered process ID. The user-mode collector inventories modules, maps
+executable memory, classifies regions not backed by loader-visible modules,
+applies event de-duplication, and writes a tamper-evident JSONL stream.
 
----
+The components produce telemetry only. They do not terminate processes,
+modify target memory, block image loads, or issue enforcement decisions.
 
-## Зачем ещё один античит
+## System architecture
 
-Рынок разделён на два полюса. Kernel-решения (EAC, BattlEye, Vanguard) дороги,
-требуют подписи драйвера, вызывают отторжение у пользователей и недоступны
-большинству команд. Самописные user-mode «проверки» обычно представляют собой
-пару вызовов `IsDebuggerPresent()`, список «плохих» имён DLL и
-`TerminateProcess` — они ловят только самых ленивых читеров и при этом
-регулярно наказывают невиновных.
+```text
+Windows kernel
+  PsSetCreateProcessNotifyRoutineEx
+  PsSetLoadImageNotifyRoutine
+               |
+               v
+  AcTelemetry.sys bounded event queue
+               |
+       versioned buffered IOCTL
+               |
+               v
+anticheat.exe
+  kernel event collector
+  module inventory
+  executable-memory classification
+  de-duplication and resource budgets
+               |
+               v
+tamper-evident JSONL
+               |
+               v
+integrator-owned storage, transport, correlation, and policy
+```
 
-Этот проект занимает третью позицию: **честный источник телеметрии**.
+The driver and collector use the shared ABI defined in
+[`include/ac_driver_protocol.h`](include/ac_driver_protocol.h). The driver
+device is exclusive and accessible only to `SYSTEM` and local
+`Administrators`.
 
-| | Kernel anti-cheat | Типичный самопис | user-mode-anticheat |
-| --- | --- | --- | --- |
-| Порог входа | подпись драйвера, месяцы | часы | `cmake --build`, минуты |
-| Права на процесс | ring 0 | `VM_WRITE`, `TERMINATE` | только чтение, закреплено тестом |
-| Реакция на сигнал | бан, kill | kill на первом совпадении | событие в журнале |
-| Ложные срабатывания | измеряются | не измеряются | измеряются, счётчики в каждом скане |
-| Возможность апелляции | ограниченная | никакой | журнал с цепочкой хешей |
-| Стойкость к обходу | высокая | иллюзорная | **низкая, и мы об этом пишем** |
+## Supported configurations
 
-Если нужна стойкость ring 0 — берите ring 0. Если нужны данные, по которым
-можно строить серверные правила, копить статистику и не брать на себя риск
-автобанов, — это здесь.
+| Component | Architecture | Build requirement |
+| --- | --- | --- |
+| Kernel driver | x64 | Visual Studio, matching Windows SDK and WDK |
+| User-mode collector | x64, Win32 | Visual Studio 2022 and CMake 3.24+ |
+| Portable core tests | Linux, macOS, Windows | C11 compiler and CMake |
+| Log verifier | Platform-independent | Python 3 |
 
----
+Use the x64 collector for x64 targets. A Win32 collector cannot enumerate all
+modules of an x64 process.
 
-## Что он делает
-
-* **Инвентаризация модулей.** Полный список загруженных модулей x64/x86 и
-  SHA-256 файла на диске для всего, что лежит вне доверенных каталогов. Хеш —
-  то, что позволяет коррелировать находки между сессиями и машинами.
-* **Карта исполняемой памяти.** Каждый исполняемый регион сопоставляется со
-  списком загрузчика. Всё, что загрузчик не объясняет, попадает в журнал с
-  типом (`image` / `mapped` / `private`) и защитой страниц.
-* **Обнаружение образов вне списка загрузчика.** Исполняемая память типа
-  `MEM_IMAGE`, отсутствующая в списке модулей, — это форма unlinking, ровно то,
-  чем маскируются инжекторы.
-* **Проба на PE-заголовок.** Подозрительный регион читается на 4 КиБ, ищется
-  `MZ` / `PE\0\0` и машинный тип. PE-образ в памяти, о которой загрузчик не
-  знает, — самый сильный сигнал, который выдаёт этот сенсор.
-* **Отпечатки содержимого.** SHA-256 первых 4 КиБ региона: один и тот же
-  payload по новому адресу опознаётся как та же находка.
-* **Подавление повторов.** Одинаковые находки сообщаются один раз, затем
-  подавляются на настраиваемый интервал и повторяются со счётчиком
-  `occurrences`. Журнал остаётся читаемым и на многочасовой сессии.
-* **Журнал с цепочкой хешей.** Правка, перестановка, удаление или вставка
-  строки в собранном журнале обнаруживаются проверяющей утилитой.
-* **Бюджет производительности.** Длительность каждого скана измеряется, выход
-  за бюджет — отдельное событие. Объём чтения чужой памяти ограничен.
-
-## Чего он сознательно не делает
-
-Это раздел про доверие, а не список недоработок.
-
-* **Не пишет в память цели.** Процесс открывается без `PROCESS_VM_WRITE`,
-  `PROCESS_VM_OPERATION`, `PROCESS_TERMINATE` и `PROCESS_CREATE_THREAD`.
-  Выданная маска доступа пишется в событие `target_opened`, а тест
-  `test_open_process_uses_read_only_access` падает, если кто-то попробует
-  расширить права.
-* **Не завершает процесс и не банит.** В коде нет ни одной такой ветки. Потеря
-  прогресса из-за ложного срабатывания — недопустимая цена.
-* **Не сканирует посторонние процессы.** Только тот, что назван явно. Обход
-  всей системы по памяти — плохая граница приватности и источник конфликтов с
-  защитным ПО.
-* **Не ходит в сеть.** В агенте нет сетевого кода. Доставку событий вы
-  проектируете сами и видите весь трафик.
-* **Не выдаёт себя за kernel-решение.** Процесс с равными правами может
-  остановить агент, подменить его данные или удалить журнал. Об этом написано
-  в [SECURITY.md](SECURITY.md), а не спрятано за словом «защищённый».
-
----
-
-## Быстрый старт
-
-Нужны Windows 10/11, Visual Studio 2022 (workload «Desktop development with
-C++») и CMake 3.24+.
+## Build the user-mode collector
 
 ```powershell
 cmake -S . -B build -A x64
@@ -101,214 +66,272 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-Один скан:
+The executable is generated at:
 
-```powershell
-.\build\Release\anticheat.exe --process game.exe --once
+```text
+build\Release\anticheat.exe
 ```
 
-Постоянное наблюдение:
+The normal CI matrix builds and tests x64 and Win32 collectors. The portable
+core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer.
+
+## Build the kernel driver
+
+Install Visual Studio with Desktop C++ support and a matching Windows SDK/WDK
+pair. Microsoft requires matching SDK and WDK build numbers.
+
+From a Developer Command Prompt:
+
+```powershell
+msbuild driver\AcTelemetry.vcxproj `
+  /p:Configuration=Release `
+  /p:Platform=x64
+```
+
+Expected output:
+
+```text
+driver\x64\Release\AcTelemetry.sys
+```
+
+The project does not enable production signing. Development systems must use a
+test-signed package and an isolated test configuration. Production deployment
+requires a signed catalog and a driver package accepted by the applicable
+Microsoft signing process.
+
+Microsoft references:
+
+- [Download and install the WDK](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk)
+- [Build a driver with MSBuild](https://learn.microsoft.com/windows-hardware/drivers/develop/building-a-driver)
+- [Driver package components](https://learn.microsoft.com/windows-hardware/drivers/install/components-of-a-driver-package)
+- [Test-signing driver packages](https://learn.microsoft.com/windows-hardware/drivers/install/test-signing-driver-packages)
+
+## Development installation
+
+The repository includes `driver/AcTelemetry.inf` for package preparation.
+During local driver development, an elevated terminal can register a
+test-signed binary directly:
+
+```powershell
+sc.exe create AcTelemetry `
+  type= kernel `
+  start= demand `
+  binPath= "C:\absolute\path\AcTelemetry.sys"
+
+sc.exe start AcTelemetry
+```
+
+Remove the development service:
+
+```powershell
+sc.exe stop AcTelemetry
+sc.exe delete AcTelemetry
+```
+
+Do not load unsigned or test-signed kernel code on production endpoints.
+Validate the driver with Driver Verifier and WinDbg on a disposable test
+system before deployment.
+
+## Collector operation
+
+User-mode telemetry only:
 
 ```powershell
 .\build\Release\anticheat.exe `
   --process game.exe `
   --interval-ms 5000 `
-  --allow-root "C:\Program Files\Steam" `
   --log anticheat-events.jsonl
 ```
 
-Проверка целостности собранного журнала:
+User-mode telemetry plus optional kernel events:
 
 ```powershell
-python tools\verify_log.py anticheat-events.jsonl
+.\build\Release\anticheat.exe `
+  --pid 1234 `
+  --kernel `
+  --interval-ms 5000 `
+  --log anticheat-events.jsonl
 ```
 
-```
-lines:    1284
-segments: 1
-events:
-    1240  scan_completed
-      41  module_outside_allowed_roots
-       3  suspicious_executable_region
-severity: high=1  medium=2  low=41  info=1240
-integrity: OK
+Require an operational kernel driver:
+
+```powershell
+.\build\Release\anticheat.exe `
+  --pid 1234 `
+  --require-kernel `
+  --log anticheat-events.jsonl
 ```
 
-### Пример события
+`--kernel` continues with user-mode collection when the driver is unavailable.
+`--require-kernel` exits with a nonzero status if the device cannot be opened,
+the protocol version is incompatible, target registration fails, or event
+reads fail.
 
-```json
-{"seq":184,"timestamp":"2026-07-28T10:00:00.000Z","severity":"high",
- "event":"suspicious_executable_region","pid":1234,
- "details":{"scan_id":37,"base":"0x1f4a0000","size":163840,"protect":32,
-   "type":"private","backed_by_loaded_module":false,"pe_header":true,
-   "pe_machine":"0x8664","content_sha256_4k":"9f2c…",
-   "reason":"private_executable","verdict":"signal_only",
-   "first_seen_scan_id":37,"occurrences":1,"suppressed_since_last_report":0},
- "chain":"8f14e45fceea167a…"}
-```
+The driver device ACL requires the collector to run as `SYSTEM` or as an
+administrator when kernel telemetry is enabled. User-mode-only collection does
+not require administrative privileges when the target process ACL permits
+read access.
 
-Читается так: в процессе есть приватная исполняемая память на 160 КиБ, не
-принадлежащая ни одному загруженному модулю, и в её начале лежит заголовок
-64-битного PE-образа. Загрузчик Windows о нём не знает. Это ручной маппинг —
-или очень необычный JIT. Дальше решает сервер.
+## Integration sequence
 
-Полный контракт: [docs/event-schema.md](docs/event-schema.md).
+1. Build and sign `AcTelemetry.sys` for the target Windows release.
+2. Install and start the `AcTelemetry` driver service during product setup.
+3. Start the protected application and retain its PID and process handle.
+4. Start `anticheat.exe --pid <pid> --require-kernel`.
+5. Read the JSONL file or forward complete lines to the integrator's collector.
+6. Validate each log segment with `tools/verify_log.py`.
+7. Enforce schema compatibility using `details.schema` from
+   `log_segment_opened` and `agent_started`.
+8. Correlate signals on the server. Do not treat a single client event as an
+   enforcement decision.
+9. Monitor expected `scan_completed` cadence and kernel queue-overflow events.
+10. Stop the collector before unloading or upgrading the driver.
 
----
+For launchers that must capture the earliest possible post-launch image loads,
+create the application suspended, obtain its PID, start the collector with
+`--require-kernel`, wait for `kernel_driver_connected`, then resume the
+application. Image mappings performed before target registration are not
+replayed by the driver; the user-mode module inventory covers the current
+state at the next scan.
 
-## Ключевые опции
+## CLI contract
 
-| Опция | Назначение |
+| Option | Description |
 | --- | --- |
-| `--process <name>` / `--pid <id>` | цель наблюдения; `--pid` снимает неоднозначность при одинаковых именах |
-| `--interval-ms <n>` | период скана, 1000…3600000 (по умолчанию 5000) |
-| `--allow-root <dir>` | дополнительный доверенный каталог модулей, можно повторять |
-| `--repeat-interval-ms <n>` | когда повторять уже сообщённую находку (`0` — не повторять) |
-| `--scan-budget-ms <n>` | порог, выше которого скан считается слишком дорогим |
-| `--max-log-bytes`, `--log-generations` | ротация журнала |
-| `--no-module-hashes`, `--no-region-probe` | отключение дорогих проверок |
-| `--wait-timeout-ms <n>` | не ждать появления процесса вечно |
+| `--process <name>` | Resolve a target by executable name. |
+| `--pid <id>` | Select an explicit target PID. Preferred for integration. |
+| `--wait-timeout-ms <n>` | Stop waiting for a named process after `n` milliseconds. |
+| `--interval-ms <n>` | User-mode scan interval, `1000..3600000`. |
+| `--once` | Run one user-mode scan and exit. |
+| `--allow-root <dir>` | Add an expected module root. Repeatable. |
+| `--kernel` | Consume driver events when the driver is available. |
+| `--require-kernel` | Require driver connectivity and protocol compatibility. |
+| `--scan-budget-ms <n>` | Emit an event when a scan exceeds the configured duration. |
+| `--repeat-interval-ms <n>` | Re-emit a de-duplicated finding after `n` milliseconds. |
+| `--no-module-hashes` | Disable SHA-256 calculation for modules outside allowed roots. |
+| `--no-region-probe` | Disable content probing of suspicious executable regions. |
+| `--log <path>` | Set the JSONL output path. |
+| `--max-log-bytes <n>` | Rotate the active log after `n` bytes. `0` disables rotation. |
+| `--log-generations <n>` | Set the number of retained rotated segments. |
+| `--quiet` | Disable JSONL mirroring to standard output. |
 
-Коды возврата: `0` успех, `2` ошибка аргументов, `3` журнал недоступен,
-`4` цель не найдена, `5` отказ в доступе, `6` внутренняя ошибка. Годится и для
-лаунчера, и для CI.
+Exit codes:
 
----
+| Code | Meaning |
+| --- | --- |
+| `0` | Completed successfully. |
+| `2` | Invalid command-line arguments. |
+| `3` | Log initialization failed. |
+| `4` | Target process was not found or identity validation failed. |
+| `5` | Required process or driver access was denied. |
+| `6` | Internal or required-kernel runtime failure. |
 
-## Архитектура
+## Kernel protocol
 
+The driver exposes `\\.\AcTelemetry` and supports:
+
+| IOCTL | Direction | Purpose |
+| --- | --- | --- |
+| `IOCTL_AC_GET_VERSION` | Driver to client | Return protocol and structure versions. |
+| `IOCTL_AC_SET_TARGET` | Client to driver | Register or clear one target PID. |
+| `IOCTL_AC_READ_EVENTS` | Driver to client | Return up to 32 queued fixed-size events. |
+| `IOCTL_AC_GET_STATS` | Driver to client | Return queue depth, dropped-event count, and callback state. |
+
+All IOCTLs use `METHOD_BUFFERED`. Structures use fixed-width fields and an
+explicit 8-byte packing contract. The user-mode client validates protocol
+version, structure size, and returned byte count before consuming data.
+
+See [docs/driver-integration.md](docs/driver-integration.md) for the complete
+ABI and lifecycle contract.
+
+## Event output
+
+The collector writes UTF-8 JSON Lines. Each line contains:
+
+- monotonically increasing collector sequence number;
+- UTC timestamp;
+- severity and stable event identifier;
+- target PID;
+- event-specific `details`;
+- SHA-256 integrity-chain value.
+
+Kernel-originated records contain the driver's independent sequence number and
+100-nanosecond system timestamp. Relevant event identifiers are:
+
+- `kernel_driver_connected`;
+- `kernel_target_changed`;
+- `kernel_process_created`;
+- `kernel_process_exited`;
+- `kernel_image_loaded`;
+- `kernel_event_queue_overflow`;
+- `kernel_event_read_failed`.
+
+The complete schema is defined in
+[docs/event-schema.md](docs/event-schema.md).
+
+Verify log segments from oldest to newest:
+
+```powershell
+python tools\verify_log.py `
+  anticheat-events.jsonl.2 `
+  anticheat-events.jsonl.1 `
+  anticheat-events.jsonl
 ```
-сбор → нормализация → независимые сигналы → корреляция → журнал → политика сервера
-```
 
-Агент отвечает за всё до журнала включительно и сознательно ничего не решает.
+## Operational constraints
 
-```
+- The driver queue contains 512 events and overwrites the oldest event when
+  full. Every overwrite increments `events_dropped`.
+- A read returns at most 32 events. The collector drains at most eight batches
+  per scan iteration to bound CPU usage.
+- Only one device handle is allowed at a time.
+- Target registration is PID-based. The collector separately validates target
+  image path and process creation time.
+- The driver reports image loads for the active PID, direct child-process
+  creation, and target exit. It clears the active PID after recording exit.
+- Kernel callbacks report image mappings; they do not inspect or modify image
+  contents.
+- The driver does not enumerate image mappings that occurred before target
+  registration.
+- The user-mode scanner still provides the current module and executable-memory
+  view.
+- Driver unload unregisters callbacks before deleting the device object.
+- The current driver is a development WDM implementation. Production release
+  requires Driver Verifier, HLK/signing validation, upgrade testing, crash-dump
+  analysis, and explicit OS-version support policy.
+
+## Repository structure
+
+```text
+include/
+  ac_driver_protocol.h    shared kernel/user ABI
+driver/
+  AcTelemetry.vcxproj     WDK x64 driver project
+  AcTelemetry.inf         driver package metadata
+  src/driver.c            callbacks, device, IOCTLs, bounded queue
 src/
-  sha256.c  text.c  ranges.c  dedup.c   портируемое ядро, без WinAPI
-  log.c                                 JSONL, ротация, цепочка хешей
-  process.c                             поиск цели, минимальные права
-  scanner.c                             модули, память, классификация
-  main.c                                CLI, жизненный цикл, сигналы
+  kernel_client.c         user-mode driver client
+  process.c               target discovery and identity validation
+  scanner.c               module and memory telemetry
+  log.c                   JSONL output, rotation, integrity chain
+  dedup.c                 bounded finding de-duplication
+  ranges.c                executable range index
+  sha256.c                SHA-256 implementation
+  text.c                  JSON escaping and fingerprints
+tests/
+  test_core.c             Windows integration and ABI tests
+  test_portable.c         portable unit tests
+tools/
+  verify_log.py           log-chain verifier
 ```
 
-Портируемое ядро собирается и тестируется на любой платформе: в CI оно
-проходит под AddressSanitizer и UBSan на Linux, а SHA-256 сверяется с
-контрольными векторами NIST. Windows-часть собирается и тестируется на x64 и
-x86, включая сквозной скан живого процесса с последующей проверкой цепочки
-журнала.
+## Additional documentation
 
-### Поиск региона за O(log n)
+- [Driver integration](docs/driver-integration.md)
+- [Event schema](docs/event-schema.md)
+- [Security model](SECURITY.md)
+- [Technical roadmap](ROADMAP.md)
 
-Диапазоны модулей сортируются и объединяются в непересекающийся индекс, по
-которому идёт бинарный поиск. Наивный перебор давал бы O(модули × регионы) —
-на процессе с сотнями модулей и десятками тысяч регионов это заметно.
+## License
 
-### Почему подавление повторов устроено именно так
-
-Отпечаток находки выбирается по её природе:
-
-* модуль — по пути в нижнем регистре: ASLR не создаёт дубликатов;
-* регион с PE-заголовком — по хешу содержимого: тот же payload по новому адресу
-  остаётся той же находкой;
-* регион без PE-заголовка — по причине, защите и корзине размера: JIT, который
-  создаёт тысячи разных кодовых регионов, схлопывается в несколько записей
-  вместо того, чтобы переполнить таблицу.
-
-При переполнении таблицы агент **отказывает в открытую**: начинает сообщать всё
-подряд и пишет счётчик `dedup_saturated_events`. Потерять обнаружение хуже, чем
-потерять тишину.
-
----
-
-## Стоимость
-
-Агент измеряет её сам и пишет в каждый `scan_completed`: `duration_ms`,
-`regions_visited`, `probe_bytes`.
-
-* Скан — это обход карты памяти и списка модулей; между сканами агент спит на
-  ожидании объекта ядра, а не крутит цикл.
-* Чтение чужой памяти ограничено 4 МиБ на скан и 4 КиБ на регион; событий по
-  регионам — не больше 64 на скан.
-* Хеширование файлов выполняется только для модулей вне доверенных каталогов и
-  только в момент фактической публикации события.
-* Превышение `--scan-budget-ms` (по умолчанию 250 мс) — отдельное событие
-  `scan_budget_exceeded`, а не молчаливая просадка FPS.
-
-Цифры на вашем железе получите сами: запустите с `--once` и посмотрите
-`duration_ms`. Чужие бенчмарки за свои мы не выдаём.
-
----
-
-## Интеграция
-
-1. Запускайте агент рядом с приложением с теми же правами. Администратор не
-   нужен.
-2. Складывайте JSONL туда, где наблюдаемый пользователь не может его
-   переписать.
-3. Отправляйте события на сервер и **проверяйте цепочку** при приёме.
-4. Стройте правила на сервере, а не в агенте: правило живёт в audit mode, пока
-   вы не измерили его false-positive rate на реальных конфигурациях.
-5. Реакции вводите лестницей: телеметрия → ограничение рейтинговой сессии →
-   мягкий disconnect → санкция с возможностью апелляции.
-
-Событие `scan_completed` приходит каждый интервал — его отсутствие само по себе
-сигнал: сенсор остановили.
-
----
-
-## Где это уместно уже сейчас
-
-* **Игры** — сбор доказательной базы до того, как вы решитесь на kernel-модуль
-  или на покупку коммерческого решения.
-* **Прокторинг и онлайн-экзамены** — цель задаётся любым именем процесса, а
-  «неизвестный модуль внутри приложения» и «исполняемая память вне загрузчика»
-  ровно так же описывают инъекцию в экзаменационный клиент.
-* **Разбор инцидентов** — `--once` даёт снимок процесса с хешами модулей и
-  отпечатками подозрительных регионов.
-* **Исследования и обучение** — компактный читаемый пример того, как строятся
-  user-mode детекторы и почему они ограничены.
-
----
-
-## Ограничения
-
-Лучше узнать о них здесь, чем в проде.
-
-* **Ring 3 не создаёт корня доверия.** Процесс с равными правами останавливает
-  или обманывает агент.
-* **Каталог — это не доверие.** `--allow-root` — эвристика до появления
-  подписанного манифеста сборки (см. [ROADMAP.md](ROADMAP.md)).
-* **Нет проверки Authenticode и целостности секций PE.** Неизвестный модуль
-  пока опознаётся по расположению и хешу файла, а не по издателю.
-* **JIT и скриптовые рантаймы легитимно создают исполняемую приватную
-  память.** Поэтому её severity — `medium`, а не `high`.
-* **Toolhelp не видит всего и подвержен гонкам.** Список модулей коррелируется
-  с картой памяти, поэтому unlink-модуль обнаруживается как аномалия памяти, а
-  не как модуль.
-* **32-битная сборка не перечислит модули 64-битной цели.** Разрядность агента
-  пишется в `agent_started` — коллектор обязан её проверять.
-* **Цепочка хешей делает журнал tamper-evident, а не tamper-proof.** Атакующий
-  с контролем над машиной может выбросить журнал целиком.
-
----
-
-## Документация
-
-* [docs/event-schema.md](docs/event-schema.md) — контракт событий, severity,
-  правило цепочки хешей.
-* [ROADMAP.md](ROADMAP.md) — что нужно, чтобы это стало продуктом.
-* [SECURITY.md](SECURITY.md) — модель угроз, гарантии сборки, приём отчётов.
-
-Справочники WinAPI: [CreateToolhelp32Snapshot][snapshot],
-[QueryFullProcessImageName][image-name], [VirtualQueryEx][virtual-query],
-[ReadProcessMemory][read-memory].
-
-## Лицензия
-
-MIT — см. [LICENSE](LICENSE).
-
-[snapshot]: https://learn.microsoft.com/windows/win32/api/tlhelp32/nf-tlhelp32-createtoolhelp32snapshot
-[image-name]: https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew
-[virtual-query]: https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex
-[read-memory]: https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-readprocessmemory
+MIT. See [LICENSE](LICENSE).

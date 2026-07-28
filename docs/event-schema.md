@@ -1,214 +1,432 @@
-# Схема событий
+# Event Schema
 
-Версия схемы: **2** (`AC_SCHEMA_VERSION`). Каждый запуск объявляет версию, на
-которой говорит, в событии `agent_started`, — коллектор может отказаться от
-неизвестного источника или адаптироваться к нему.
+Schema version: `3` (`AC_SCHEMA_VERSION`).
 
-Агент пишет **JSON Lines**: по одному целому JSON-объекту на строку, UTF-8, без
-висящих запятых, с завершающим переводом строки. Строка никогда не разрывается
-между записями и сбрасывается на диск до появления следующей, поэтому читатель
-в режиме tail всегда видит целые события.
+The collector writes UTF-8 JSON Lines. Each line contains one complete JSON
+object followed by `LF`. The writer flushes each record before writing the
+next record.
 
-## Конверт
-
-Все строки имеют одинаковый конверт:
+## Envelope
 
 ```json
 {
   "seq": 12,
   "timestamp": "2026-07-28T10:00:00.000Z",
-  "severity": "medium",
-  "event": "suspicious_executable_region",
+  "severity": "info",
+  "event": "kernel_image_loaded",
   "pid": 1234,
-  "details": { },
+  "details": {},
   "chain": "8f14e45fceea167a5a36dedd4bea2543..."
 }
 ```
 
-| Поле | Тип | Значение |
+| Field | Type | Contract |
 | --- | --- | --- |
-| `seq` | целое | Монотонный счётчик, начинается с 1 при каждом запуске. Пропуск означает, что строки удалены. |
-| `timestamp` | строка | UTC, миллисекунды, ISO-8601. Настенное время — для упорядочивания используйте `seq`, а не его. |
-| `severity` | строка | `info`, `low`, `medium`, `high`. См. контракт ниже. |
-| `event` | строка | Стабильный идентификатор. Новые события могут добавляться; смысл существующих в пределах версии схемы не меняется. |
-| `pid` | целое | Процесс-цель или `0`, если событие о самом агенте. |
-| `details` | объект | Полезная нагрузка, документирована по каждому событию ниже. |
-| `chain` | строка | 64 hex-символа. Значение целостности, см. ниже. |
+| `seq` | unsigned integer | Collector-local sequence. Starts at 1 for each collector instance. |
+| `timestamp` | string | UTC ISO-8601 timestamp with millisecond precision. |
+| `severity` | string | `info`, `low`, `medium`, or `high`. |
+| `event` | string | Stable event identifier within the schema version. |
+| `pid` | unsigned integer | Target PID, or `0` for collector-wide records. |
+| `details` | object | Event-specific payload. |
+| `chain` | string | Lowercase 64-character SHA-256 integrity value. |
 
-## Цепочка целостности
+Consumers must order records by `seq`. Wall-clock timestamps may move backward
+or forward because of system time changes.
 
-Журнал **tamper-evident**: правка, перестановка, удаление или вставка строки
-обнаруживаются без доверия к процессу, который писал файл.
+## Integrity chain
 
-Пусть `body[i]` — точные байты строки `i` до суффикса `,"chain":"…"}`. Тогда:
+For exact record body bytes ending immediately before `,"chain":"..."}`:
 
-```
-chain[0] = seed                          # из события log_segment_opened
+```text
 chain[i] = SHA256(chain[i-1] || body[i])
 ```
 
-Seed публикуется в `details.chain_seed` события `log_segment_opened`, которым
-открывается каждый сегмент файла. Цепочка не прерывается при ротации —
-проверяйте сегменты от старого к новому.
+`log_segment_opened.details.chain_seed` contains the initial chain value for a
+collector instance. Rotated segments retain sequence and chain continuity.
+Verify segments from oldest to newest:
 
-Проверка штатной утилитой:
-
-```bash
-python tools/verify_log.py events.jsonl.2 events.jsonl.1 events.jsonl
-python tools/verify_log.py --self-test
+```powershell
+python tools\verify_log.py events.jsonl.2 events.jsonl.1 events.jsonl
 ```
 
-**Что это даёт и чего не даёт.** Тихие правки собранного журнала становятся
-обнаружимыми — именно это нужно процессу апелляции или разбора спора. Это не
-останавливает атакующего, который контролирует машину: он может выбросить
-журнал и записать новый, внутренне согласованный. Только отправка головы
-цепочки за пределы машины (см. дорожную карту) превращает tamper-evidence в
-tamper-resistance.
+The chain detects retained-record modification, insertion, removal, and
+reordering. It does not prevent complete log replacement by a principal that
+controls the endpoint. Remote systems should persist sequence and chain-head
+checkpoints during the session.
 
-## Контракт severity
+## Severity contract
 
-Severity описывает **силу сигнала, а не вину**. Каждая находка дополнительно
-несёт `"verdict": "signal_only"`.
+| Severity | Technical meaning |
+| --- | --- |
+| `info` | Lifecycle, configuration, health, accounting, or raw telemetry. |
+| `low` | Weak anomaly or operational degradation. |
+| `medium` | Anomaly requiring correlation; known legitimate sources exist. |
+| `high` | Strong process-integrity anomaly; still not an enforcement decision. |
 
-| Severity | Значение | Как обрабатывать |
+Detection records include either `"verdict":"signal_only"` or
+`"verdict":"telemetry_only"`.
+
+## Collector lifecycle events
+
+### `log_segment_opened`
+
+Severity: `info`.
+
+Fields:
+
+| Field | Type |
+| --- | --- |
+| `agent` | string |
+| `version` | string |
+| `schema` | unsigned integer |
+| `chain_algorithm` | `"sha256"` |
+| `chain_seed` | 64-character hex string |
+| `max_bytes` | unsigned integer |
+| `generations` | unsigned integer |
+| `reason` | optional string; `size_limit` after rotation |
+
+### `agent_started`
+
+Severity: `info`.
+
+Fields:
+
+| Field | Type | Values |
 | --- | --- | --- |
-| `info` | Жизненный цикл и учёт. | Хранить, использовать для метрик покрытия. |
-| `low` | Часто встречается в нормальных конфигурациях. | Только корреляция. Никогда не основание само по себе. |
-| `medium` | Встречается редко, но производится и легальным ПО (JIT, оверлеи, DRM). | Агрегировать по сессиям до принятия решений. |
-| `high` | Редко в здоровом процессе, совпадает с формой инъекции. | Заслуживает разбора. Всё ещё не доказательство. |
+| `agent` | string | `anticheat-collector` |
+| `version` | string | collector semantic version |
+| `schema` | unsigned integer | `3` |
+| `mode` | string | `user_telemetry` or `hybrid_kernel_user_telemetry` |
+| `memory_write_access` | boolean | `false` |
+| `terminates_target` | boolean | `false` |
+| `interval_ms` | unsigned integer | configured scan interval |
+| `once` | boolean | one-scan mode |
+| `scan_budget_ms` | unsigned integer | performance threshold |
+| `repeat_interval_ms` | unsigned integer | de-duplication interval |
+| `pointer_bits` | unsigned integer | `32` or `64` |
 
-## События жизненного цикла
+### `waiting_for_process`
 
-### `log_segment_opened` (`info`)
-Открывает сегмент файла. Пишется при открытии журнала и после каждой ротации.
+Severity: `info`.
 
-| Поле | Значение |
+Fields:
+
+- `process_name`: requested executable name.
+
+### `wait_for_process_timed_out`
+
+Severity: `info`.
+
+Fields:
+
+- `verdict`: `no_target`.
+
+### `multiple_process_matches`
+
+Severity: `low`.
+
+Fields:
+
+- `matches`: number of matching executable names;
+- `selected_pid`: selected PID;
+- `hint`: integration guidance.
+
+Use `--pid` in production integrations to avoid name ambiguity.
+
+### `target_opened`
+
+Severity: `info`.
+
+Fields:
+
+- `path`;
+- `granted_access`: hexadecimal Win32 access mask;
+- `least_privilege`;
+- `start_time_filetime`;
+- `allow_roots`.
+
+### `target_identity_mismatch`
+
+Severity: `medium`.
+
+The image path associated with the opened process does not match the requested
+executable name. The collector does not scan the process.
+
+### `allow_root_configured`
+
+Severity: `info`.
+
+Fields:
+
+- `path`: one expected module root.
+
+Directory membership is an operational classification, not cryptographic file
+identity.
+
+### `target_exited`
+
+Severity: `info`.
+
+The target process handle entered the signaled state.
+
+### `agent_stopped`
+
+Severity: `info`.
+
+Fields:
+
+- `scans`;
+- `kernel_events`;
+- `terminated_target`: always `false`;
+- `log_write_failures`;
+- `log_truncated_lines`;
+- `exit_code`.
+
+## Kernel transport events
+
+### `kernel_driver_connected`
+
+Severity: `info`.
+
+Fields:
+
+| Field | Type |
 | --- | --- |
-| `agent`, `version`, `schema` | Идентификация источника. |
-| `chain_algorithm`, `chain_seed` | Параметры целостности этого сегмента. |
-| `max_bytes`, `generations` | Действующая политика ротации. |
-| `reason` | `size_limit` у сегментов, открытых ротацией. |
+| `protocol_version` | unsigned integer |
+| `event_size` | unsigned integer |
+| `queue_capacity` | unsigned integer |
+| `target_pid` | unsigned integer |
 
-### `agent_started` (`info`)
-Объявляет рабочие рамки, включая обещания сборки: `mode: observe_only`,
-`memory_write_access: false`, `terminates_target: false`, а также
-`interval_ms`, `scan_budget_ms`, `repeat_interval_ms` и `pointer_bits`.
+This record confirms protocol validation and successful target registration.
 
-`pointer_bits` важен: 32-битный агент не перечислит модули 64-битной цели
-корректно. Коллектор должен отвергать сессии, где 32-битный агент наблюдал за
-64-битным приложением.
+### `kernel_driver_open_failed`
 
-### `waiting_for_process` (`info`), `wait_for_process_timed_out` (`info`)
-Ход поиска цели.
+Severity: `low`.
 
-### `multiple_process_matches` (`low`)
-Имени процесса соответствует больше одной цели. Содержит `matches` и выбранный
-`selected_pid`; оператору следует указать `--pid`.
+Standard Win32 error payload:
 
-### `target_opened` (`info`)
-`path`, `granted_access` (фактически выданная маска доступа в hex),
-`least_privilege` (истина, когда хватило пониженного уровня),
-`start_time_filetime` (якорь идентичности, переживающий переиспользование PID),
-`allow_roots`.
+- `win32_error`;
+- `message`.
 
-### `target_identity_mismatch` (`medium`)
-Имя образа у открытого PID не совпадает с запрошенным — переиспользование PID
-или гонка. Агент отказывается сканировать и завершается.
+In `--kernel` mode the collector continues with user-mode telemetry. In
+`--require-kernel` mode it exits.
 
-### `allow_root_configured` (`info`)
-Один доверенный каталог модулей; пишется по одному событию на каталог, чтобы
-журнал сам описывал политику, под которой он собран.
+### `kernel_target_registration_failed`
 
-### `target_exited` (`info`), `agent_stopped` (`info`)
-`agent_stopped` содержит `scans`, `terminated_target: false`, `exit_code` и
-счётчики здоровья журнала (`log_write_failures`, `log_truncated_lines`).
+Severity: `low`.
 
-### `scan_completed` (`info`)
-Учёт по каждому скану и основа для метрик стоимости и ложных срабатываний:
+The driver rejected `IOCTL_AC_SET_TARGET`. The payload contains the Win32
+error code returned by `DeviceIoControl`.
 
-`scan_id`, `duration_ms`, `modules`, `module_list_truncated`,
-`modules_outside_allowed_roots`, `regions_visited`, `executable_regions`,
-`suspicious_regions`, `query_failures`, `read_failures`, `probe_bytes`,
-`events_emitted`, `events_suppressed`, `dedup_entries`,
-`dedup_saturated_events`.
+### Kernel callback event envelope
 
-### `scan_budget_exceeded` (`low`)
-Скан занял больше `--scan-budget-ms`. Содержит `duration_ms`, `budget_ms` и
-накопительный счётчик `breaches`.
+The following event identifiers use the same detail contract:
 
-### `scan_failed`, `open_process_failed`, `query_process_path_failed`, … (`low`)
-Операционные ошибки с полями `win32_error` и `message`.
+- `kernel_target_changed`;
+- `kernel_process_created`;
+- `kernel_process_exited`;
+- `kernel_image_loaded`;
+- `kernel_event_unknown`.
 
-## События обнаружения
+Fields:
 
-### `module_outside_allowed_roots` (`low`)
+| Field | Type | Contract |
+| --- | --- | --- |
+| `driver_sequence` | unsigned integer | Monotonic sequence assigned in the driver. |
+| `kernel_timestamp_100ns` | unsigned integer | System time in 100-nanosecond intervals. |
+| `type` | unsigned integer | `AcDriverEventType`. |
+| `flags` | unsigned integer | `AC_DRIVER_EVENT_FLAG_*` bitmask. |
+| `parent_pid` | unsigned integer | Available for process creation. |
+| `status` | string | NTSTATUS formatted as hexadecimal. |
+| `image_base` | string | 64-bit hexadecimal address. |
+| `image_size` | unsigned integer | Mapped image size. |
+| `path` | string | Bounded image path; may be empty. |
+| `source` | string | `kernel_callback`. |
+| `verdict` | string | `telemetry_only`. |
 
-Загруженный модуль, файл которого лежит вне всех доверенных каталогов.
+Driver event types:
 
-| Поле | Значение |
+| Value | Identifier |
 | --- | --- |
-| `path`, `base`, `size` | Идентификация модуля в цели. |
-| `file_sha256`, `file_size` | Хеш файла на диске, `null` если файл нечитаем. Именно это поле делает возможной корреляцию между сессиями. |
+| `1` | `AC_DRIVER_EVENT_TARGET_CHANGED` |
+| `2` | `AC_DRIVER_EVENT_PROCESS_CREATED` |
+| `3` | `AC_DRIVER_EVENT_PROCESS_EXITED` |
+| `4` | `AC_DRIVER_EVENT_IMAGE_LOADED` |
+
+`kernel_process_created` may describe a direct child of the registered target.
+In that case the envelope `pid` is the child PID and `details.parent_pid` is
+the registered target PID.
+
+Driver event flags:
+
+| Bit | Identifier |
+| --- | --- |
+| `0x00000001` | `AC_DRIVER_EVENT_FLAG_PATH_TRUNCATED` |
+| `0x00000002` | `AC_DRIVER_EVENT_FLAG_SYSTEM_IMAGE` |
+| `0x00000004` | `AC_DRIVER_EVENT_FLAG_PATH_UNAVAILABLE` |
+
+### `kernel_event_queue_overflow`
+
+Severity: `low`.
+
+Fields:
+
+- `events_dropped`: cumulative overwritten-event count;
+- `newly_dropped`: increase since the previous statistics read;
+- `queue_depth`;
+- `queue_capacity`.
+
+The driver overwrites the oldest event when the fixed queue is full.
+
+### `kernel_event_read_failed`
+
+Severity: `low`.
+
+The IOCTL read or statistics request failed, or the returned protocol data was
+malformed. The collector closes the driver handle after this record.
+
+## User-mode scan events
+
+### `scan_completed`
+
+Severity: `info`.
+
+Fields:
+
+| Field | Type |
+| --- | --- |
+| `scan_id` | unsigned integer |
+| `duration_ms` | unsigned integer |
+| `modules` | unsigned integer |
+| `module_list_truncated` | boolean |
+| `modules_outside_allowed_roots` | unsigned integer |
+| `regions_visited` | unsigned integer |
+| `executable_regions` | unsigned integer |
+| `suspicious_regions` | unsigned integer |
+| `query_failures` | unsigned integer |
+| `read_failures` | unsigned integer |
+| `probe_bytes` | unsigned integer |
+| `events_emitted` | unsigned integer |
+| `events_suppressed` | unsigned integer |
+| `dedup_entries` | unsigned integer |
+| `dedup_saturated_events` | unsigned integer |
+
+Consumers should monitor the expected event cadence. Missing
+`scan_completed` records indicate a stopped collector, blocked collector, or
+lost transport.
+
+### `scan_budget_exceeded`
+
+Severity: `low`.
+
+Fields:
+
+- `scan_id`;
+- `duration_ms`;
+- `budget_ms`;
+- `breaches`: cumulative breach count.
+
+### Operational failure events
+
+Examples:
+
+- `scan_failed`;
+- `open_process_failed`;
+- `query_process_path_failed`;
+- `derive_game_directory_failed`;
+- `wait_failed`;
+- `context_init_failed`.
+
+Win32 failure records contain:
+
+- `win32_error`;
+- `message`.
+
+## Detection events
+
+### `module_outside_allowed_roots`
+
+Severity: `low`.
+
+Fields:
+
+| Field | Type |
+| --- | --- |
+| `scan_id` | unsigned integer |
+| `path` | string |
+| `base` | hexadecimal string |
+| `size` | unsigned integer |
+| `file_sha256` | string or `null` |
+| `file_size` | unsigned integer |
 | `reason` | `outside_allowed_roots` |
-| `first_seen_scan_id`, `occurrences`, `suppressed_since_last_report` | Учёт подавления повторов. |
+| `verdict` | `signal_only` |
+| `first_seen_scan_id` | unsigned integer |
+| `occurrences` | unsigned integer |
+| `suppressed_since_last_report` | unsigned integer |
 
-Каталог — это не доверие. Сигнал существует, чтобы коррелировать его с
-allowlist хешей, а не чтобы действовать по нему напрямую.
+### `suspicious_executable_region`
 
-### `suspicious_executable_region` (`low` … `high`)
+Severity: `low`, `medium`, or `high`.
 
-Исполняемая память, которую загрузчик не объясняет.
+Fields:
 
-| Поле | Значение |
+| Field | Type |
 | --- | --- |
-| `base`, `size`, `protect`, `type` | Идентификация региона (`type` — `image`, `mapped`, `private`). |
-| `backed_by_loaded_module` | Попадает ли регион в модуль, который признаёт загрузчик. |
-| `pe_header` | В начале региона найден PE-заголовок. |
-| `pe_machine` | Поле machine этого заголовка, например `0x8664`. |
-| `content_sha256_4k` | SHA-256 фактически прочитанных первых 4 КиБ, `null` при неудаче чтения. |
-| `reason` | См. таблицу ниже. |
+| `scan_id` | unsigned integer |
+| `base` | hexadecimal string |
+| `size` | unsigned integer |
+| `protect` | unsigned integer |
+| `type` | `image`, `mapped`, `private`, or `unknown` |
+| `backed_by_loaded_module` | boolean |
+| `pe_header` | boolean |
+| `pe_machine` | hexadecimal string |
+| `content_sha256_4k` | string or `null` |
+| `reason` | classification identifier |
+| `verdict` | `signal_only` |
+| `first_seen_scan_id` | unsigned integer |
+| `occurrences` | unsigned integer |
+| `suppressed_since_last_report` | unsigned integer |
 
-| `reason` | Severity | Что означает |
+Classification identifiers:
+
+| Reason | Default severity | Meaning |
 | --- | --- | --- |
-| `image_not_in_loader_list` | `high` | Исполняемая память типа image, отсутствующая в списке загрузчика — форма unlinking. |
-| `mapped_executable_outside_module` | `medium` | Исполняемый маппинг секции вне известных модулей — форма ручного маппинга через section object. |
-| `private_executable` | `medium` | Исполняемая приватная память. Её же создаёт любой JIT. |
-| `private_writable_executable` | `medium` | Приватная RWX-память. |
-| `writable_executable_inside_module` | `low` | RWX внутри известного модуля — необычно, но так делают некоторые упаковщики и DRM. |
-| `executable_memory_unknown_type` | `medium` | Тип региона вне документированного набора. |
+| `image_not_in_loader_list` | `high` | Executable `MEM_IMAGE` region absent from the loader-visible module index. |
+| `mapped_executable_outside_module` | `medium` | Executable mapped region outside known module ranges. |
+| `private_executable` | `medium` | Executable private memory. |
+| `private_writable_executable` | `medium` | Writable and executable private memory. |
+| `writable_executable_inside_module` | `low` | Writable executable region inside a known module. |
+| `executable_memory_unknown_type` | `medium` | Executable region with an unclassified memory type. |
 
-Любая из причин повышается до `high`, если `pe_header` истинно и регион не
-принадлежит загруженному модулю: PE-образ в памяти, о которой загрузчик не
-знает, — самый сильный сигнал, который выдаёт этот сенсор.
+An executable region outside a loader-visible module is emitted as `high` when
+the bounded content probe finds a valid PE header.
 
-## Подавление повторов
+## De-duplication
 
-Одинаковые находки сообщаются один раз, затем подавляются до истечения
-`--repeat-interval-ms` (по умолчанию 5 минут), после чего сообщаются снова с
-полями `occurrences` и `suppressed_since_last_report`. Значение `0` означает
-«сообщить каждую отдельную находку ровно один раз за запуск».
+The collector emits a finding on first observation. It suppresses equivalent
+findings until `--repeat-interval-ms` expires, then emits the finding with
+updated occurrence counters.
 
-Отпечатки выбраны так, чтобы шумные, но безобидные источники схлопывались, а
-редкие сигналы оставались различимыми:
+Fingerprints:
 
-* модули — по пути в нижнем регистре, поэтому релокация не создаёт дубликатов;
-* регионы с PE-заголовком — по хешу содержимого, поэтому тот же payload по
-  новому адресу опознаётся как та же находка;
-* регионы без PE-заголовка — по причине, защите и корзине размера (степень
-  двойки), поэтому JIT, создающий тысячи разных кодовых регионов, схлопывается
-  в несколько записей вместо переполнения таблицы.
+- modules: case-insensitive path;
+- executable regions with a PE header: bounded content hash;
+- executable regions without a PE header: reason, protection, and size bucket.
 
-Таблица рассчитана на 4096 записей. При переполнении агент **отказывает в
-открытую** — начинает сообщать вместо подавления — и пишет
-`dedup_saturated_events` в `scan_completed`. Потерять обнаружение хуже, чем
-потерять тишину.
+The table contains 4096 entries. When saturated, findings are emitted without
+suppression and `dedup_saturated_events` increases.
 
-## Как потреблять журнал
+## Consumer requirements
 
-* Упорядочивайте по `seq`, а не по `timestamp`.
-* Неизвестные значения `event` считайте `info` и сохраняйте: новые обнаружения
-  добавляются в пределах версии схемы.
-* Реагируйте и на отсутствие событий: нет `scan_completed` несколько интервалов
-  подряд — сенсор остановлен, и это само по себе сигнал.
-* Смотрите `severity` и `reason` вместе: `reason` — стабильный идентификатор
-  правила, `severity` — настройка, которая может меняться между версиями.
+Consumers must:
+
+1. validate the schema version;
+2. parse one line as one record;
+3. order records by `seq`;
+4. verify the integrity chain before relying on retained local records;
+5. retain unknown event identifiers;
+6. use `reason` as the stable classifier and `severity` as a configurable
+   priority;
+7. monitor sequence gaps, kernel dropped-event counters, and scan cadence;
+8. correlate kernel and user-mode records by target PID, session, and time;
+9. keep account or session enforcement outside the collector.
