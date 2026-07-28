@@ -57,7 +57,13 @@ jobs:
         shell: pwsh
         run: |
           $collector = Join-Path '${{ matrix.binary_dir }}' 'Release\anticheat.exe'
-          $target = Start-Process -PassThru -FilePath powershell `
+          if ('${{ matrix.arch }}' -eq 'Win32') {
+            $targetExecutable = Join-Path $env:WINDIR `
+              'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
+          } else {
+            $targetExecutable = (Get-Command powershell).Source
+          }
+          $target = Start-Process -PassThru -FilePath $targetExecutable `
             -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 120'
           try {
             & $collector --pid $target.Id --once --quiet --log smoke.jsonl
