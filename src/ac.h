@@ -30,6 +30,7 @@ typedef struct AcModule {
     wchar_t path[MAX_PATH];
 } AcModule;
 
+/* Roughly 1.1 MiB on x64 Windows; allocate this type dynamically. */
 typedef struct AcModuleList {
     AcModule items[AC_MAX_MODULES];
     size_t count;

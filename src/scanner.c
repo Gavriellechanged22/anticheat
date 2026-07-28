@@ -1,6 +1,7 @@
 #include "ac.h"
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 #include <tlhelp32.h>
 #include <wchar.h>
@@ -329,7 +330,7 @@ bool ac_scan_process(
     uint64_t scan_id,
     AcScanStats *stats_out)
 {
-    AcModuleList modules;
+    AcModuleList *modules;
     AcScanStats stats;
     DWORD error;
     size_t index;
@@ -341,14 +342,21 @@ bool ac_scan_process(
     }
 
     memset(&stats, 0, sizeof(stats));
-    if (!ac_collect_modules(pid, &modules, &error)) {
+    modules = (AcModuleList *)calloc(1, sizeof(*modules));
+    if (modules == NULL) {
+        SetLastError(ERROR_OUTOFMEMORY);
+        return false;
+    }
+
+    if (!ac_collect_modules(pid, modules, &error)) {
+        free(modules);
         SetLastError(error);
         return false;
     }
 
-    stats.module_count = modules.count;
-    for (index = 0; index < modules.count; ++index) {
-        const AcModule *module = &modules.items[index];
+    stats.module_count = modules->count;
+    for (index = 0; index < modules->count; ++index) {
+        const AcModule *module = &modules->items[index];
         const bool expected =
             ac_path_is_under(module->path, game_directory) ||
             ac_path_is_under(module->path, windows_directory);
@@ -364,7 +372,7 @@ bool ac_scan_process(
         process,
         pid,
         scan_id,
-        &modules,
+        modules,
         &stats);
 
     (void)snprintf(
@@ -376,7 +384,7 @@ bool ac_scan_process(
         "\"query_failures\":%zu}",
         scan_id,
         stats.module_count,
-        modules.truncated ? "true" : "false",
+        modules->truncated ? "true" : "false",
         stats.outside_expected_roots,
         stats.executable_region_count,
         stats.suspicious_region_count,
@@ -384,5 +392,6 @@ bool ac_scan_process(
     ac_log_event(logger, AC_SEVERITY_INFO, "scan_completed", pid, details);
 
     *stats_out = stats;
+    free(modules);
     return true;
 }

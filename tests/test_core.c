@@ -1,6 +1,7 @@
 #include "ac.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_failures = 0;
@@ -34,29 +35,36 @@ static void test_path_boundaries(void)
 
 static void test_module_ranges(void)
 {
-    AcModuleList modules;
+    AcModuleList *modules;
 
-    memset(&modules, 0, sizeof(modules));
-    modules.count = 1;
-    modules.items[0].base = (uintptr_t)0x10000000u;
-    modules.items[0].size = 0x10000u;
+    modules = (AcModuleList *)calloc(1, sizeof(*modules));
+    AC_CHECK(modules != NULL);
+    if (modules == NULL) {
+        return;
+    }
+
+    modules->count = 1;
+    modules->items[0].base = (uintptr_t)0x10000000u;
+    modules->items[0].size = 0x10000u;
 
     AC_CHECK(ac_address_range_in_module(
-        &modules,
+        modules,
         (uintptr_t)0x10000000u,
         0x1000u));
     AC_CHECK(ac_address_range_in_module(
-        &modules,
+        modules,
         (uintptr_t)0x1000f000u,
         0x1000u));
     AC_CHECK(!ac_address_range_in_module(
-        &modules,
+        modules,
         (uintptr_t)0x0ffff000u,
         0x2000u));
     AC_CHECK(!ac_address_range_in_module(
-        &modules,
+        modules,
         (uintptr_t)0x1000f000u,
         0x2000u));
+
+    free(modules);
 }
 
 static void test_json_escaping(void)
