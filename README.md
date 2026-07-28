@@ -1,6 +1,7 @@
 # Anticheat Telemetry
 
 [![build-and-test](https://github.com/amandykovxd/anticheat/actions/workflows/windows-build.yml/badge.svg)](https://github.com/amandykovxd/anticheat/actions/workflows/windows-build.yml)
+[![CodeQL](https://github.com/amandykovxd/anticheat/actions/workflows/codeql.yml/badge.svg)](https://github.com/amandykovxd/anticheat/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](#supported-configurations)
 [![Language: C11](https://img.shields.io/badge/language-C11-555555.svg)](CMakeLists.txt)
@@ -336,6 +337,15 @@ tools/
 - [Event schema](docs/event-schema.md)
 - [Security model](SECURITY.md)
 - [Technical roadmap](ROADMAP.md)
+- [Technical support](SUPPORT.md)
+- [Wiki source](docs/wiki/Home.md)
+
+Project coordination:
+
+- [Engineering project](https://github.com/users/amandykovxd/projects/1)
+- [Issues](https://github.com/amandykovxd/anticheat/issues)
+- [Discussions](https://github.com/amandykovxd/anticheat/discussions)
+- [Security](https://github.com/amandykovxd/anticheat/security)
 
 ## Contributing
 

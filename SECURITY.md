@@ -239,8 +239,10 @@ hashing, or memory from processes other than the registered target.
 
 ## Vulnerability reporting
 
-Report security issues through a private repository security advisory when
-available. Include:
+Report security issues through
+[GitHub private vulnerability reporting](https://github.com/amandykovxd/anticheat/security/advisories/new).
+Do not create a public issue or discussion before remediation is available.
+Include:
 
 - collector version;
 - driver protocol version;
