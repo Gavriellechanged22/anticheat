@@ -373,6 +373,7 @@ int wmain(int argc, wchar_t **argv)
     char details[1024];
     uint64_t scan_id = 0;
     size_t root_count = 0;
+    size_t root_index;
     bool exit_now = false;
     bool context_ready = false;
     int exit_code = AC_EXIT_INTERNAL;
@@ -473,7 +474,9 @@ int wmain(int argc, wchar_t **argv)
 
     ac_policy_init_defaults(&policy);
     policy.allow_root_count = root_count;
-    memcpy(policy.allow_roots, roots, root_count * sizeof(roots[0]));
+    for (root_index = 0; root_index < root_count; ++root_index) {
+        policy.allow_roots[root_index] = roots[root_index];
+    }
     policy.repeat_interval_ms = options.repeat_interval_ms;
     policy.scan_budget_ms = options.scan_budget_ms;
     policy.hash_unknown_modules = !options.skip_module_hashes;
