@@ -20,7 +20,7 @@ Kernel boundary
   AcTelemetry.sys
   process/image callbacks
   bounded event queue
-  SYSTEM/Administrators-only device ACL
+  SYSTEM-only device ACL
            |
            | versioned METHOD_BUFFERED IOCTL
            v
@@ -55,9 +55,10 @@ The current driver:
 - uses a fixed-capacity nonpaged queue;
 - exposes only fixed-size, versioned structures;
 - uses `METHOD_BUFFERED` for all IOCTLs;
-- validates input size, protocol version, reserved fields, and target PID;
+- validates input size, protocol version, reserved fields, session ID, and
+  target PID;
 - uses `IoCreateDeviceSecure` with
-  `D:P(A;;GA;;;SY)(A;;GA;;;BA)`;
+  `D:P(A;;GA;;;SY)`;
 - creates an exclusive device handle;
 - reports queue overwrites through `events_dropped`;
 - does not return kernel pointers.
@@ -118,16 +119,13 @@ location and must not forward an untrusted user's path into `--log`.
 `AcTelemetry.sys` applies this SDDL to the device object:
 
 ```text
-D:P(A;;GA;;;SY)(A;;GA;;;BA)
+D:P(A;;GA;;;SY)
 ```
 
-The descriptor grants full access to:
-
-- Local System (`SY`);
-- built-in Administrators (`BA`).
+The descriptor grants full access only to Local System (`SY`).
 
 No access is granted to standard users. The user-mode collector must run under
-one of the allowed principals when `--kernel` or `--require-kernel` is used.
+Local System when `--kernel` or `--require-kernel` is used.
 
 The IOCTL access bits additionally require:
 
@@ -155,7 +153,8 @@ Required driver checks:
 2. target requests contain the current protocol version.
 3. reserved fields are zero.
 4. nonzero target PIDs resolve to a live process at registration time.
-5. event reads are limited to `AC_DRIVER_MAX_BATCH_EVENTS`.
+5. session IDs are nonzero and cannot replace another active session.
+6. event reads are limited to `AC_DRIVER_MAX_BATCH_EVENTS`.
 
 Protocol changes that alter structure size or semantics require a protocol
 version increment.
@@ -169,7 +168,7 @@ allocate memory in process or image callbacks.
 The collector:
 
 - reads no more than 32 events per IOCTL;
-- drains no more than eight batches per scan iteration;
+- drains no more than eight batches every 250 milliseconds between scans;
 - emits `kernel_event_queue_overflow` when the dropped-event counter increases;
 - stops kernel collection on malformed protocol data;
 - exits when `--require-kernel` is active and required driver reads fail.

@@ -1,5 +1,6 @@
 #include "ac.h"
 
+#include <bcrypt.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,9 +29,39 @@ typedef struct AcOptions {
     bool quiet;
     bool skip_module_hashes;
     bool skip_region_probe;
+    bool skip_module_integrity;
+    uint64_t integrity_budget_bytes;
+    uint64_t integrity_max_file_bytes;
     bool kernel_telemetry;
     bool require_kernel;
 } AcOptions;
+
+static DWORD ac_jittered_interval(DWORD interval_ms)
+{
+    uint32_t random_value = 0;
+    const DWORD spread = interval_ms / 5u;
+    uint64_t candidate;
+
+    if (spread == 0 ||
+        BCryptGenRandom(
+            NULL,
+            (PUCHAR)&random_value,
+            (ULONG)sizeof(random_value),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        return interval_ms;
+    }
+
+    candidate =
+        (uint64_t)interval_ms - spread +
+        ((uint64_t)random_value % ((uint64_t)spread * 2u + 1u));
+    if (candidate < 1000u) {
+        candidate = 1000u;
+    }
+    if (candidate > 3600000u) {
+        candidate = 3600000u;
+    }
+    return (DWORD)candidate;
+}
 
 static HANDLE g_stop_event = NULL;
 
@@ -80,6 +111,11 @@ static void ac_print_usage(const wchar_t *program)
         L"  --repeat-interval-ms <n>  re-report an identical signal after this (default 300000)\n"
         L"  --no-module-hashes        do not SHA-256 unknown module files\n"
         L"  --no-region-probe         do not read suspicious region content\n"
+        L"\n"
+        L"Module integrity:\n"
+        L"  --no-module-integrity     do not validate executable sections against disk\n"
+        L"  --integrity-budget <n>    bytes hashed per scan (default 16777216)\n"
+        L"  --integrity-max-file <n>  largest module file to validate (default 67108864)\n"
         L"\n"
         L"Kernel telemetry:\n"
         L"  --kernel                  consume AcTelemetry driver events when available\n"
@@ -147,6 +183,8 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
     options->log_generations = 5u;
     options->repeat_interval_ms = 300000u;
     options->scan_budget_ms = 250u;
+    options->integrity_budget_bytes = 16ull * 1024ull * 1024ull;
+    options->integrity_max_file_bytes = 64ull * 1024ull * 1024ull;
     *exit_now = false;
 
     if (argc == 2 && wcscmp(argv[1], L"--version") == 0) {
@@ -173,6 +211,18 @@ static bool ac_parse_options(int argc, wchar_t **argv, AcOptions *options, bool 
             options->skip_module_hashes = true;
         } else if (wcscmp(argument, L"--no-region-probe") == 0) {
             options->skip_region_probe = true;
+        } else if (wcscmp(argument, L"--no-module-integrity") == 0) {
+            options->skip_module_integrity = true;
+        } else if (wcscmp(argument, L"--integrity-budget") == 0 && has_value) {
+            if (!ac_parse_u64(argv[++index], 0u, 4096ull * 1024ull * 1024ull, &number)) {
+                return false;
+            }
+            options->integrity_budget_bytes = number;
+        } else if (wcscmp(argument, L"--integrity-max-file") == 0 && has_value) {
+            if (!ac_parse_u64(argv[++index], 0u, 4096ull * 1024ull * 1024ull, &number)) {
+                return false;
+            }
+            options->integrity_max_file_bytes = number;
         } else if (wcscmp(argument, L"--kernel") == 0) {
             options->kernel_telemetry = true;
         } else if (wcscmp(argument, L"--require-kernel") == 0) {
@@ -383,6 +433,49 @@ static void ac_log_allow_roots(
     }
 }
 
+static void ac_log_collector_identity(AcLogger *logger)
+{
+    wchar_t path[MAX_PATH];
+    char path_utf8[MAX_PATH * 3];
+    char escaped_path[MAX_PATH * 6];
+    char digest[AC_SHA256_HEX_SIZE];
+    char details[MAX_PATH * 6 + 256];
+    uint64_t file_size = 0;
+    const DWORD length = GetModuleFileNameW(
+        NULL,
+        path,
+        (DWORD)(sizeof(path) / sizeof(path[0])));
+
+    if (length == 0 ||
+        length >= (DWORD)(sizeof(path) / sizeof(path[0])) ||
+        !ac_hash_file(path, digest, &file_size) ||
+        !ac_wide_to_utf8(path, path_utf8, sizeof(path_utf8))) {
+        ac_log_event(
+            logger,
+            AC_SEVERITY_MEDIUM,
+            "collector_identity_unavailable",
+            GetCurrentProcessId(),
+            "{\"reason\":\"collector_file_unreadable\"}");
+        return;
+    }
+
+    (void)ac_json_escape(path_utf8, escaped_path, sizeof(escaped_path));
+    (void)snprintf(
+        details,
+        sizeof(details),
+        "{\"path\":\"%s\",\"file_sha256\":\"%s\",\"file_size\":%" PRIu64
+        ",\"reason\":\"collector_identity_observed\"}",
+        escaped_path,
+        digest,
+        file_size);
+    ac_log_event(
+        logger,
+        AC_SEVERITY_INFO,
+        "collector_identity_observed",
+        GetCurrentProcessId(),
+        details);
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     AcOptions options;
@@ -453,6 +546,7 @@ int wmain(int argc, wchar_t **argv)
         options.repeat_interval_ms,
         sizeof(void *) * 8u);
     ac_log_event(&logger, AC_SEVERITY_INFO, "agent_started", 0, details);
+    ac_log_collector_identity(&logger);
 
     if (!ac_resolve_target_pid(&options, &logger, &target.pid)) {
         exit_code = ac_stop_requested() ? AC_EXIT_OK : AC_EXIT_TARGET_NOT_FOUND;
@@ -512,6 +606,9 @@ int wmain(int argc, wchar_t **argv)
     policy.scan_budget_ms = options.scan_budget_ms;
     policy.hash_unknown_modules = !options.skip_module_hashes;
     policy.probe_region_content = !options.skip_region_probe;
+    policy.verify_module_integrity = !options.skip_module_integrity;
+    policy.integrity_budget_bytes = options.integrity_budget_bytes;
+    policy.integrity_max_file_bytes = options.integrity_max_file_bytes;
 
     if (!ac_context_init(&context, &logger, &policy)) {
         ac_log_event(
@@ -554,11 +651,19 @@ int wmain(int argc, wchar_t **argv)
 
     if (options.kernel_telemetry) {
         if (!ac_kernel_client_open(&kernel_client)) {
-            ac_log_win32_error(
+            char kernel_error[128];
+            const DWORD error = GetLastError();
+            (void)snprintf(
+                kernel_error,
+                sizeof(kernel_error),
+                "{\"win32_error\":%lu,\"reason\":\"required_sensor_unavailable\"}",
+                (unsigned long)error);
+            ac_log_event(
                 &logger,
+                options.require_kernel ? AC_SEVERITY_HIGH : AC_SEVERITY_MEDIUM,
                 "kernel_driver_open_failed",
                 target.pid,
-                GetLastError());
+                kernel_error);
             if (options.require_kernel) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
                 goto cleanup;
@@ -567,11 +672,18 @@ int wmain(int argc, wchar_t **argv)
                        &kernel_client,
                        target.pid)) {
             const DWORD error = GetLastError();
-            ac_log_win32_error(
+            char kernel_error[128];
+            (void)snprintf(
+                kernel_error,
+                sizeof(kernel_error),
+                "{\"win32_error\":%lu,\"reason\":\"session_registration_rejected\"}",
+                (unsigned long)error);
+            ac_log_event(
                 &logger,
+                AC_SEVERITY_HIGH,
                 "kernel_target_registration_failed",
                 target.pid,
-                error);
+                kernel_error);
             ac_kernel_client_close(&kernel_client);
             if (options.require_kernel) {
                 exit_code = AC_EXIT_ACCESS_DENIED;
@@ -644,9 +756,58 @@ int wmain(int argc, wchar_t **argv)
             break;
         }
 
-        wait_handles[0] = target.process;
-        wait_handles[1] = g_stop_event;
-        wait_result = WaitForMultipleObjects(2u, wait_handles, FALSE, options.interval_ms);
+        {
+            const ULONGLONG deadline =
+                GetTickCount64() + ac_jittered_interval(options.interval_ms);
+            bool next_scan = false;
+
+            wait_handles[0] = target.process;
+            wait_handles[1] = g_stop_event;
+            for (;;) {
+                const ULONGLONG now = GetTickCount64();
+                const ULONGLONG remaining = now < deadline ? deadline - now : 0;
+                const DWORD wait_slice =
+                    remaining > 250u ? 250u : (DWORD)remaining;
+
+                if (remaining == 0) {
+                    next_scan = true;
+                    wait_result = WAIT_TIMEOUT;
+                    break;
+                }
+
+                wait_result = WaitForMultipleObjects(
+                    2u,
+                    wait_handles,
+                    FALSE,
+                    wait_slice);
+                if (wait_result != WAIT_TIMEOUT) {
+                    break;
+                }
+
+                if (kernel_ready &&
+                    !ac_kernel_client_drain(
+                        &kernel_client,
+                        &logger,
+                        target.pid,
+                        &kernel_events)) {
+                    ac_log_win32_error(
+                        &logger,
+                        "kernel_event_read_failed",
+                        target.pid,
+                        GetLastError());
+                    ac_kernel_client_close(&kernel_client);
+                    kernel_ready = false;
+                    if (options.require_kernel) {
+                        exit_code = AC_EXIT_INTERNAL;
+                        goto cleanup;
+                    }
+                }
+            }
+
+            if (next_scan) {
+                continue;
+            }
+        }
 
         if (wait_result == WAIT_OBJECT_0) {
             if (kernel_ready) {
@@ -666,7 +827,7 @@ int wmain(int argc, wchar_t **argv)
         }
         if (wait_result == WAIT_FAILED) {
             ac_log_win32_error(&logger, "wait_failed", target.pid, GetLastError());
-            Sleep(options.interval_ms);
+            Sleep(ac_jittered_interval(options.interval_ms));
         }
     }
 

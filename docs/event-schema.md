@@ -1,6 +1,6 @@
 # Event Schema
 
-Schema version: `3` (`AC_SCHEMA_VERSION`).
+Schema version: `4` (`AC_SCHEMA_VERSION`).
 
 The collector writes UTF-8 JSON Lines. Each line contains one complete JSON
 object followed by `LF`. The writer flushes each record before writing the
@@ -95,7 +95,7 @@ Fields:
 | --- | --- | --- |
 | `agent` | string | `anticheat-collector` |
 | `version` | string | collector semantic version |
-| `schema` | unsigned integer | `3` |
+| `schema` | unsigned integer | `4` |
 | `mode` | string | `user_telemetry` or `hybrid_kernel_user_telemetry` |
 | `memory_write_access` | boolean | `false` |
 | `terminates_target` | boolean | `false` |
@@ -104,6 +104,22 @@ Fields:
 | `scan_budget_ms` | unsigned integer | performance threshold |
 | `repeat_interval_ms` | unsigned integer | de-duplication interval |
 | `pointer_bits` | unsigned integer | `32` or `64` |
+
+### `collector_identity_observed`
+
+Severity: `info`.
+
+Fields:
+
+- `path`;
+- `file_sha256`;
+- `file_size`;
+- `reason`: `collector_identity_observed`.
+
+Deployment must compare the digest with the signed release manifest. If the
+collector file cannot be identified, `collector_identity_unavailable` is emitted
+at `medium`. This is an identity signal, not in-process attestation; a server
+nonce remains necessary against collector-process compromise.
 
 ### `waiting_for_process`
 
@@ -201,22 +217,23 @@ This record confirms protocol validation and successful target registration.
 
 ### `kernel_driver_open_failed`
 
-Severity: `low`.
+Severity: `medium`, or `high` when `--require-kernel` is active.
 
-Standard Win32 error payload:
+Fields:
 
 - `win32_error`;
-- `message`.
+- `reason`: `required_sensor_unavailable`.
 
 In `--kernel` mode the collector continues with user-mode telemetry. In
 `--require-kernel` mode it exits.
 
 ### `kernel_target_registration_failed`
 
-Severity: `low`.
+Severity: `high`.
 
 The driver rejected `IOCTL_AC_SET_TARGET`. The payload contains the Win32
-error code returned by `DeviceIoControl`.
+error code returned by `DeviceIoControl` and reason
+`session_registration_rejected`.
 
 ### Kernel callback event envelope
 
@@ -267,7 +284,7 @@ Driver event flags:
 
 ### `kernel_event_queue_overflow`
 
-Severity: `low`.
+Severity: `medium`.
 
 Fields:
 
@@ -310,10 +327,43 @@ Fields:
 | `events_suppressed` | unsigned integer |
 | `dedup_entries` | unsigned integer |
 | `dedup_saturated_events` | unsigned integer |
+| `integrity_modules_checked` | unsigned integer |
+| `integrity_modules_unavailable` | unsigned integer |
+| `integrity_blocks_checked` | unsigned integer |
+| `integrity_blocks_modified` | unsigned integer |
+| `integrity_unreadable_blocks` | unsigned integer |
+| `integrity_iat_slots_checked` | unsigned integer |
+| `integrity_iat_hooks` | unsigned integer |
+| `integrity_export_slots_checked` | unsigned integer |
+| `integrity_export_hooks` | unsigned integer |
+| `integrity_modules_partial` | unsigned integer |
+| `integrity_modules_skipped` | unsigned integer |
+| `integrity_file_changes` | unsigned integer |
+| `region_events_omitted` | unsigned integer |
+| `region_scan_truncated` | boolean |
+| `integrity_bytes` | unsigned integer |
+| `integrity_baselines` | unsigned integer |
 
 Consumers should monitor the expected event cadence. Missing
 `scan_completed` records indicate a stopped collector, blocked collector, or
 lost transport.
+
+A sustained `integrity_modules_checked` of zero while `modules` is nonzero
+indicates that module validation is disabled or permanently budget-starved.
+
+### `scan_coverage_gap`
+
+Severity: `medium`.
+
+Emitted whenever a module or region cap prevents a complete scan. Fields:
+
+- `scan_id`;
+- `module_list_truncated`;
+- `region_scan_truncated`;
+- `region_events_omitted`;
+- `integrity_modules_partial`;
+- `integrity_modules_skipped`;
+- `reason`: `scan_coverage_incomplete`.
 
 ### `scan_budget_exceeded`
 
@@ -401,6 +451,119 @@ Classification identifiers:
 An executable region outside a loader-visible module is emitted as `high` when
 the bounded content probe finds a valid PE header.
 
+## Module integrity events
+
+The collector reconstructs the bytes the loader is expected to place at each
+executable section of a loader-visible module, normalises the differences the
+loader legitimately introduces, and compares 4 KiB blocks by SHA-256.
+
+Normalisation applied before comparison:
+
+- base relocations for the observed load delta (`HIGHLOW`, `DIR64`);
+- import address tables from the IAT directory and every `FirstThunk` array;
+- delay-import address tables and module handle slots;
+- section bytes with no file backing (`SizeOfRawData` below `VirtualSize`);
+- relocation forms this build cannot apply, which are excluded rather than
+  reported.
+
+The disk-derived baseline is computed once per module load base and cached.
+Every scan rechecks the file volume, file index, size, and last-write time.
+Unloaded-module baselines are pruned and unavailable baselines are retried.
+
+### `module_identity_observed`
+
+Severity: `info`.
+
+Emitted once for every loader-visible module baseline, including modules inside
+allowed roots. Fields:
+
+- `path`, `module_base`;
+- `file_sha256`, `file_size`, `file_time`;
+- `volume_serial`, `file_index`;
+- `reason`: `module_identity_observed`.
+
+The server must compare this identity with the signed application manifest.
+Directory membership alone is not a trust decision.
+
+### `module_file_identity_changed`
+
+Severity: `high`.
+
+The file identity changed after its baseline was created. The cached baseline
+is discarded and rebuilt; the mapped executable bytes are then compared with
+the new file identity.
+
+### `module_section_modified`
+
+Severity: `high`.
+
+Fields:
+
+| Field | Type | Contract |
+| --- | --- | --- |
+| `path` | string | Module file path. |
+| `module_base` | hexadecimal string | Observed load base. |
+| `section` | string | Section name, for example `.text`. |
+| `block_rva` | hexadecimal string | RVA of the 4 KiB comparison block. |
+| `block_size` | unsigned integer | Compared byte count. |
+| `modified_rva` | hexadecimal string or `null` | RVA of the first differing byte. `null` when the file changed between baseline and report. |
+| `expected_sha256` | string | Block digest derived from the file on disk. |
+| `observed_sha256` | string | Block digest read from process memory. |
+| `expected_bytes` | string | Up to 16 hexadecimal bytes at `modified_rva`. |
+| `observed_bytes` | string | Same window as observed in memory. |
+| `reason` | `executable_section_modified` | |
+
+This is the detection for inline hooks, trampolines, and single-instruction
+patches that leave the loader module list intact.
+
+Known legitimate producers: packers and DRM that decrypt sections at runtime,
+debuggers holding software breakpoints, and Windows dynamic value relocations
+applied to some system images. Validate against a supported build before any
+rule derived from this event influences a user-facing decision.
+
+### `import_table_hook`
+
+Severity: `high`.
+
+Fields:
+
+- `path`, `module_base`;
+- `slot_rva`: RVA of the import thunk;
+- `target`: pointer read from that thunk;
+- `delay_load`: boolean;
+- `reason`: `iat_entry_outside_loaded_modules`.
+
+Emitted only when a thunk resolves outside every loader-visible module range.
+An import redirected into another loaded module is not reported here, because
+that module is already classified by `module_outside_allowed_roots`.
+
+### `export_table_hook`
+
+Severity: `high`.
+
+Fields:
+
+- `path`, `module_base`;
+- `export_index`: index into the export address table;
+- `expected_rva`, `observed_rva`;
+- `outside_image`: boolean, true when `observed_rva` exceeds `SizeOfImage`;
+- `reason`: `export_entry_modified`.
+
+### `module_integrity_unavailable`
+
+Severity: `low`.
+
+Fields:
+
+- `path`, `module_base`;
+- `reason`: one of `file_unreadable_or_too_large`, `truncated`, `not_pe`,
+  `unsupported`, `malformed`, `import_table_malformed`, `out_of_memory`, or
+  `baseline_budget_exceeded`.
+
+A module that cannot be validated is a coverage gap, not a clean result.
+Unavailable entries are retried periodically. Consumers should track the ratio
+of unavailable, partial, and skipped modules to checked modules.
+
 ## De-duplication
 
 The collector emits a finding on first observation. It suppresses equivalent
@@ -411,7 +574,9 @@ Fingerprints:
 
 - modules: case-insensitive path;
 - executable regions with a PE header: bounded content hash;
-- executable regions without a PE header: reason, protection, and size bucket.
+- executable regions without a PE header: reason, protection, and size bucket;
+- integrity findings: case-insensitive path and the event-specific payload, so
+  a modified block is reported once per block rather than once per scan.
 
 The table contains 4096 entries. When saturated, findings are emitted without
 suppression and `dedup_saturated_events` increases.

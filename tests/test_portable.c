@@ -1,9 +1,11 @@
 #include "dedup.h"
+#include "pe.h"
 #include "ranges.h"
 #include "sha256.h"
 #include "text.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_failures = 0;
@@ -240,6 +242,420 @@ static void test_dedup_fails_open_when_saturated(void)
     ac_dedup_free(&dedup);
 }
 
+#define AC_TEST_PE_SIZE 0x800u
+#define AC_TEST_PE_NT_OFFSET 0x40u
+#define AC_TEST_PE_OPTIONAL_OFFSET 0x58u
+#define AC_TEST_PE_TEXT_RAW 0x200u
+#define AC_TEST_PE_TEXT_RVA 0x1000u
+#define AC_TEST_PE_RDATA_RAW 0x400u
+#define AC_TEST_PE_RDATA_RVA 0x2000u
+#define AC_TEST_PE_RELOC_RAW 0x600u
+#define AC_TEST_PE_RELOC_RVA 0x3000u
+#define AC_TEST_PE_IAT_RVA 0x2100u
+#define AC_TEST_PE_RELOC_TARGET 0x10u
+#define AC_TEST_PE_IMAGE_BASE 0x140000000ull
+
+static void ac_test_put16(uint8_t *buffer, size_t offset, uint16_t value)
+{
+    buffer[offset] = (uint8_t)value;
+    buffer[offset + 1u] = (uint8_t)(value >> 8);
+}
+
+static void ac_test_put32(uint8_t *buffer, size_t offset, uint32_t value)
+{
+    buffer[offset] = (uint8_t)value;
+    buffer[offset + 1u] = (uint8_t)(value >> 8);
+    buffer[offset + 2u] = (uint8_t)(value >> 16);
+    buffer[offset + 3u] = (uint8_t)(value >> 24);
+}
+
+static void ac_test_put64(uint8_t *buffer, size_t offset, uint64_t value)
+{
+    ac_test_put32(buffer, offset, (uint32_t)value);
+    ac_test_put32(buffer, offset + 4u, (uint32_t)(value >> 32));
+}
+
+static uint64_t ac_test_get64(const uint8_t *buffer, size_t offset)
+{
+    uint64_t value = 0;
+    unsigned int index;
+
+    for (index = 0; index < 8u; ++index) {
+        value |= (uint64_t)buffer[offset + index] << (8u * index);
+    }
+    return value;
+}
+
+static void ac_test_put_section(
+    uint8_t *buffer,
+    size_t offset,
+    const char *name,
+    uint32_t virtual_size,
+    uint32_t virtual_address,
+    uint32_t raw_size,
+    uint32_t raw_offset,
+    uint32_t characteristics)
+{
+    memset(buffer + offset, 0, 8u);
+    memcpy(buffer + offset, name, strlen(name));
+    ac_test_put32(buffer, offset + 8u, virtual_size);
+    ac_test_put32(buffer, offset + 12u, virtual_address);
+    ac_test_put32(buffer, offset + 16u, raw_size);
+    ac_test_put32(buffer, offset + 20u, raw_offset);
+    ac_test_put32(buffer, offset + 36u, characteristics);
+}
+
+/* Builds a minimal but structurally valid PE32+ image with one executable
+   section, one import address table and one DIR64 base relocation. */
+static void ac_test_build_pe(uint8_t *buffer)
+{
+    const size_t optional = AC_TEST_PE_OPTIONAL_OFFSET;
+    const size_t directories = optional + 112u;
+    const size_t sections = optional + 240u;
+    unsigned int index;
+
+    memset(buffer, 0, AC_TEST_PE_SIZE);
+
+    ac_test_put16(buffer, 0, 0x5a4du);
+    ac_test_put32(buffer, 0x3cu, AC_TEST_PE_NT_OFFSET);
+
+    ac_test_put32(buffer, AC_TEST_PE_NT_OFFSET, 0x00004550u);
+    ac_test_put16(buffer, AC_TEST_PE_NT_OFFSET + 4u, 0x8664u);
+    ac_test_put16(buffer, AC_TEST_PE_NT_OFFSET + 6u, 3u);
+    ac_test_put16(buffer, AC_TEST_PE_NT_OFFSET + 20u, 240u);
+
+    ac_test_put16(buffer, optional, 0x020bu);
+    ac_test_put32(buffer, optional + 16u, AC_TEST_PE_TEXT_RVA);
+    ac_test_put64(buffer, optional + 24u, AC_TEST_PE_IMAGE_BASE);
+    ac_test_put32(buffer, optional + 56u, 0x4000u);
+    ac_test_put32(buffer, optional + 60u, 0x200u);
+    ac_test_put32(buffer, optional + 108u, 16u);
+
+    ac_test_put32(buffer, directories + 1u * 8u, AC_TEST_PE_RDATA_RVA);
+    ac_test_put32(buffer, directories + 1u * 8u + 4u, 40u);
+    ac_test_put32(buffer, directories + 5u * 8u, AC_TEST_PE_RELOC_RVA);
+    ac_test_put32(buffer, directories + 5u * 8u + 4u, 12u);
+    ac_test_put32(buffer, directories + 12u * 8u, AC_TEST_PE_IAT_RVA);
+    ac_test_put32(buffer, directories + 12u * 8u + 4u, 16u);
+
+    ac_test_put_section(
+        buffer, sections, ".text",
+        0x200u, AC_TEST_PE_TEXT_RVA, 0x200u, AC_TEST_PE_TEXT_RAW,
+        AC_PE_SCN_CNT_CODE | AC_PE_SCN_MEM_EXECUTE);
+    ac_test_put_section(
+        buffer, sections + 40u, ".rdata",
+        0x200u, AC_TEST_PE_RDATA_RVA, 0x200u, AC_TEST_PE_RDATA_RAW,
+        0x40000040u);
+    ac_test_put_section(
+        buffer, sections + 80u, ".reloc",
+        0x200u, AC_TEST_PE_RELOC_RVA, 0x200u, AC_TEST_PE_RELOC_RAW,
+        0x42000040u);
+
+    for (index = 0; index < 0x200u; ++index) {
+        buffer[AC_TEST_PE_TEXT_RAW + index] = (uint8_t)(0x90u + (index & 0x0fu));
+    }
+    ac_test_put64(
+        buffer,
+        AC_TEST_PE_TEXT_RAW + AC_TEST_PE_RELOC_TARGET,
+        AC_TEST_PE_IMAGE_BASE + AC_TEST_PE_TEXT_RVA);
+
+    /* Import descriptor followed by the terminating zero descriptor. */
+    ac_test_put32(buffer, AC_TEST_PE_RDATA_RAW + 12u, AC_TEST_PE_RDATA_RVA + 0x80u);
+    ac_test_put32(buffer, AC_TEST_PE_RDATA_RAW + 16u, AC_TEST_PE_IAT_RVA);
+
+    ac_test_put64(buffer, AC_TEST_PE_RDATA_RAW + 0x100u, 0x7ff800001234ull);
+    ac_test_put64(buffer, AC_TEST_PE_RDATA_RAW + 0x108u, 0x7ff800005678ull);
+
+    ac_test_put32(buffer, AC_TEST_PE_RELOC_RAW, AC_TEST_PE_TEXT_RVA);
+    ac_test_put32(buffer, AC_TEST_PE_RELOC_RAW + 4u, 12u);
+    ac_test_put16(buffer, AC_TEST_PE_RELOC_RAW + 8u, (uint16_t)((10u << 12) | AC_TEST_PE_RELOC_TARGET));
+    ac_test_put16(buffer, AC_TEST_PE_RELOC_RAW + 10u, 0);
+}
+
+static void test_pe_parses_valid_image(void)
+{
+    uint8_t buffer[AC_TEST_PE_SIZE];
+    AcPeImage image;
+    const AcPeSection *section;
+    uint32_t offset = 0;
+
+    ac_test_build_pe(buffer);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_OK);
+    AC_CHECK(image.is_64bit);
+    AC_CHECK(image.machine == 0x8664u);
+    AC_CHECK(image.section_count == 3u);
+    AC_CHECK(image.image_base == AC_TEST_PE_IMAGE_BASE);
+    AC_CHECK(image.size_of_image == 0x4000u);
+    AC_CHECK(image.entry_point == AC_TEST_PE_TEXT_RVA);
+    AC_CHECK(image.directories[AC_PE_DIRECTORY_IAT].rva == AC_TEST_PE_IAT_RVA);
+
+    section = ac_pe_find_section_by_rva(&image, AC_TEST_PE_TEXT_RVA + 0x20u);
+    AC_CHECK(section != NULL);
+    if (section != NULL) {
+        AC_CHECK(strcmp(section->name, ".text") == 0);
+        AC_CHECK(ac_pe_section_is_executable(section));
+    }
+
+    section = ac_pe_find_section_by_rva(&image, AC_TEST_PE_RDATA_RVA);
+    AC_CHECK(section != NULL);
+    if (section != NULL) {
+        AC_CHECK(!ac_pe_section_is_executable(section));
+    }
+
+    AC_CHECK(ac_pe_find_section_by_rva(&image, 0x9000u) == NULL);
+
+    AC_CHECK(ac_pe_rva_to_offset(&image, AC_TEST_PE_TEXT_RVA + 0x10u, &offset));
+    AC_CHECK(offset == AC_TEST_PE_TEXT_RAW + 0x10u);
+    AC_CHECK(!ac_pe_rva_to_offset(&image, 0x9000u, &offset));
+}
+
+static void test_pe_materializes_and_rebases_section(void)
+{
+    uint8_t buffer[AC_TEST_PE_SIZE];
+    uint8_t section_image[0x200];
+    AcPeImage image;
+    AcPeMask mask;
+    const AcPeSection *text;
+    const int64_t delta = 0x1000000;
+
+    ac_test_build_pe(buffer);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_OK);
+
+    text = ac_pe_find_section_by_rva(&image, AC_TEST_PE_TEXT_RVA);
+    AC_CHECK(text != NULL);
+    if (text == NULL) {
+        return;
+    }
+
+    AC_CHECK(ac_pe_materialize_section(&image, text, section_image, sizeof(section_image)) == AC_PE_OK);
+    AC_CHECK(memcmp(section_image, buffer + AC_TEST_PE_TEXT_RAW, sizeof(section_image)) == 0);
+    AC_CHECK(ac_test_get64(section_image, AC_TEST_PE_RELOC_TARGET) ==
+             AC_TEST_PE_IMAGE_BASE + AC_TEST_PE_TEXT_RVA);
+
+    ac_pe_mask_init(&mask);
+    AC_CHECK(ac_pe_apply_relocations(&image, text, section_image, delta, &mask) == AC_PE_OK);
+    AC_CHECK(ac_test_get64(section_image, AC_TEST_PE_RELOC_TARGET) ==
+             AC_TEST_PE_IMAGE_BASE + AC_TEST_PE_TEXT_RVA + (uint64_t)delta);
+    AC_CHECK(section_image[0] == 0x90u);
+
+    /* A zero delta must leave the section untouched. */
+    AC_CHECK(ac_pe_materialize_section(&image, text, section_image, sizeof(section_image)) == AC_PE_OK);
+    AC_CHECK(ac_pe_apply_relocations(&image, text, section_image, 0, &mask) == AC_PE_OK);
+    AC_CHECK(memcmp(section_image, buffer + AC_TEST_PE_TEXT_RAW, sizeof(section_image)) == 0);
+
+    ac_pe_mask_free(&mask);
+}
+
+static void test_pe_masks_import_tables(void)
+{
+    uint8_t buffer[AC_TEST_PE_SIZE];
+    uint8_t window[32];
+    AcPeImage image;
+    AcPeMask mask;
+
+    ac_test_build_pe(buffer);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_OK);
+
+    ac_pe_mask_init(&mask);
+    AC_CHECK(ac_pe_mask_import_tables(&image, &mask) == AC_PE_OK);
+    ac_pe_mask_finalize(&mask);
+
+    AC_CHECK(ac_pe_mask_covers(&mask, AC_TEST_PE_IAT_RVA));
+    AC_CHECK(ac_pe_mask_covers(&mask, AC_TEST_PE_IAT_RVA + 15u));
+    AC_CHECK(!ac_pe_mask_covers(&mask, AC_TEST_PE_IAT_RVA + 16u));
+    AC_CHECK(!ac_pe_mask_covers(&mask, AC_TEST_PE_TEXT_RVA));
+
+    memset(window, 0xabu, sizeof(window));
+    ac_pe_mask_zero(&mask, window, AC_TEST_PE_IAT_RVA - 8u, sizeof(window));
+    AC_CHECK(window[0] == 0xabu);
+    AC_CHECK(window[7] == 0xabu);
+    AC_CHECK(window[8] == 0x00u);
+    AC_CHECK(window[23] == 0x00u);
+    AC_CHECK(window[24] == 0xabu);
+
+    ac_pe_mask_free(&mask);
+}
+
+static bool ac_test_count_iat_slot(void *user, uint32_t slot_rva, bool delay_load)
+{
+    unsigned int *counter = (unsigned int *)user;
+
+    (void)delay_load;
+    if (slot_rva < AC_TEST_PE_IAT_RVA) {
+        return false;
+    }
+    ++(*counter);
+    return true;
+}
+
+static void test_pe_enumerates_iat_slots(void)
+{
+    uint8_t buffer[AC_TEST_PE_SIZE];
+    AcPeImage image;
+    unsigned int slots = 0;
+    uint32_t table_rva = 0;
+    uint32_t count = 0;
+
+    ac_test_build_pe(buffer);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_OK);
+    AC_CHECK(ac_pe_for_each_iat_slot(&image, ac_test_count_iat_slot, &slots) == AC_PE_OK);
+    AC_CHECK(slots == 2u);
+
+    AC_CHECK(ac_pe_export_functions(&image, &table_rva, &count) == AC_PE_OK);
+    AC_CHECK(table_rva == 0);
+    AC_CHECK(count == 0);
+}
+
+/* Every prefix of a valid image, and a set of corrupted headers, must be
+   rejected without reading outside the supplied buffer. Run under ASan this
+   is the bounds proof required by the acceptance criteria. */
+static void test_pe_rejects_malformed_input_without_overrun(void)
+{
+    uint8_t buffer[AC_TEST_PE_SIZE];
+    AcPeImage image;
+    size_t length;
+    size_t position;
+
+    ac_test_build_pe(buffer);
+
+    for (length = 0; length < sizeof(buffer); ++length) {
+        uint8_t *prefix = (uint8_t *)malloc(length == 0 ? 1u : length);
+
+        AC_CHECK(prefix != NULL);
+        if (prefix == NULL) {
+            return;
+        }
+        if (length > 0) {
+            memcpy(prefix, buffer, length);
+        }
+
+        if (ac_pe_parse(prefix, length, &image) == AC_PE_OK) {
+            AcPeMask mask;
+            uint16_t index;
+
+            ac_pe_mask_init(&mask);
+            (void)ac_pe_mask_import_tables(&image, &mask);
+            for (index = 0; index < image.section_count; ++index) {
+                uint8_t scratch[0x200];
+                const AcPeSection *section = &image.sections[index];
+
+                if (section->virtual_size <= sizeof(scratch)) {
+                    if (ac_pe_materialize_section(
+                            &image, section, scratch, sizeof(scratch)) == AC_PE_OK) {
+                        (void)ac_pe_apply_relocations(&image, section, scratch, 0x1000, &mask);
+                    }
+                }
+            }
+            ac_pe_mask_free(&mask);
+        }
+        free(prefix);
+    }
+
+    for (position = 0; position < 0x200u; ++position) {
+        uint8_t corrupted[AC_TEST_PE_SIZE];
+        AcPeMask mask;
+
+        ac_test_build_pe(corrupted);
+        corrupted[position] = (uint8_t)(corrupted[position] ^ 0xffu);
+
+        ac_pe_mask_init(&mask);
+        if (ac_pe_parse(corrupted, sizeof(corrupted), &image) == AC_PE_OK) {
+            uint8_t scratch[0x200];
+            uint16_t index;
+
+            (void)ac_pe_mask_import_tables(&image, &mask);
+            for (index = 0; index < image.section_count; ++index) {
+                const AcPeSection *section = &image.sections[index];
+
+                if (section->virtual_size <= sizeof(scratch) &&
+                    ac_pe_materialize_section(
+                        &image, section, scratch, sizeof(scratch)) == AC_PE_OK) {
+                    (void)ac_pe_apply_relocations(&image, section, scratch, -0x2000, &mask);
+                }
+            }
+        }
+        ac_pe_mask_free(&mask);
+    }
+
+    AC_CHECK(ac_pe_parse(NULL, 0, &image) == AC_PE_ERR_TRUNCATED);
+    AC_CHECK(ac_pe_parse(buffer, 4u, &image) == AC_PE_ERR_TRUNCATED);
+}
+
+static void test_pe_rejects_non_pe_and_unsupported(void)
+{
+    uint8_t buffer[AC_TEST_PE_SIZE];
+    AcPeImage image;
+
+    ac_test_build_pe(buffer);
+    buffer[0] = 'X';
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_ERR_NOT_PE);
+
+    ac_test_build_pe(buffer);
+    ac_test_put32(buffer, AC_TEST_PE_NT_OFFSET, 0x12345678u);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_ERR_NOT_PE);
+
+    ac_test_build_pe(buffer);
+    ac_test_put16(buffer, AC_TEST_PE_OPTIONAL_OFFSET, 0x0107u);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_ERR_UNSUPPORTED);
+
+    ac_test_build_pe(buffer);
+    ac_test_put16(buffer, AC_TEST_PE_NT_OFFSET + 6u, 0);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_ERR_UNSUPPORTED);
+
+    ac_test_build_pe(buffer);
+    ac_test_put16(buffer, AC_TEST_PE_NT_OFFSET + 6u, 4096u);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_ERR_UNSUPPORTED);
+
+    ac_test_build_pe(buffer);
+    ac_test_put32(buffer, 0x3cu, 0x7ffffff0u);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_ERR_TRUNCATED);
+}
+
+static void test_pe_relocation_block_loop_is_bounded(void)
+{
+    uint8_t buffer[AC_TEST_PE_SIZE];
+    uint8_t section_image[0x200];
+    AcPeImage image;
+    AcPeMask mask;
+    const AcPeSection *text;
+
+    /* A zero-length relocation block must not loop forever. */
+    ac_test_build_pe(buffer);
+    ac_test_put32(buffer, AC_TEST_PE_RELOC_RAW + 4u, 0);
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_OK);
+    text = ac_pe_find_section_by_rva(&image, AC_TEST_PE_TEXT_RVA);
+    AC_CHECK(text != NULL);
+    if (text == NULL) {
+        return;
+    }
+
+    ac_pe_mask_init(&mask);
+    AC_CHECK(ac_pe_materialize_section(&image, text, section_image, sizeof(section_image)) == AC_PE_OK);
+    AC_CHECK(ac_pe_apply_relocations(&image, text, section_image, 0x1000, &mask) ==
+             AC_PE_ERR_MALFORMED);
+
+    /* An unknown relocation type must be masked rather than applied. */
+    ac_pe_mask_clear(&mask);
+    ac_test_build_pe(buffer);
+    ac_test_put16(
+        buffer,
+        AC_TEST_PE_RELOC_RAW + 8u,
+        (uint16_t)((7u << 12) | AC_TEST_PE_RELOC_TARGET));
+    AC_CHECK(ac_pe_parse(buffer, sizeof(buffer), &image) == AC_PE_OK);
+    text = ac_pe_find_section_by_rva(&image, AC_TEST_PE_TEXT_RVA);
+    AC_CHECK(text != NULL);
+    if (text != NULL) {
+        AC_CHECK(ac_pe_materialize_section(&image, text, section_image, sizeof(section_image)) == AC_PE_OK);
+        AC_CHECK(ac_pe_apply_relocations(&image, text, section_image, 0x1000, &mask) == AC_PE_OK);
+        ac_pe_mask_finalize(&mask);
+        AC_CHECK(ac_pe_mask_covers(&mask, AC_TEST_PE_TEXT_RVA + AC_TEST_PE_RELOC_TARGET));
+        AC_CHECK(ac_test_get64(section_image, AC_TEST_PE_RELOC_TARGET) ==
+                 AC_TEST_PE_IMAGE_BASE + AC_TEST_PE_TEXT_RVA);
+    }
+
+    ac_pe_mask_free(&mask);
+}
+
 typedef void (*AcPortableTestFunction)(void);
 
 typedef struct AcPortableTestCase {
@@ -257,7 +673,14 @@ static const AcPortableTestCase g_test_cases[] = {
     {"range_index_many_entries", test_range_index_many_entries},
     {"dedup_suppresses_repeats", test_dedup_suppresses_repeats},
     {"dedup_zero_interval", test_dedup_never_repeats_with_zero_interval},
-    {"dedup_saturation", test_dedup_fails_open_when_saturated}
+    {"dedup_saturation", test_dedup_fails_open_when_saturated},
+    {"pe_parse_valid", test_pe_parses_valid_image},
+    {"pe_materialize_rebase", test_pe_materializes_and_rebases_section},
+    {"pe_mask_imports", test_pe_masks_import_tables},
+    {"pe_iat_slots", test_pe_enumerates_iat_slots},
+    {"pe_malformed_bounds", test_pe_rejects_malformed_input_without_overrun},
+    {"pe_rejects_non_pe", test_pe_rejects_non_pe_and_unsupported},
+    {"pe_relocation_bounds", test_pe_relocation_block_loop_is_bounded}
 };
 
 int main(int argc, char **argv)

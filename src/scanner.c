@@ -1,5 +1,6 @@
 #include "ac.h"
 
+#include <bcrypt.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,29 @@ typedef struct AcRegionFinding {
     uint16_t pe_machine;
     char content_sha256[AC_SHA256_HEX_SIZE];
 } AcRegionFinding;
+
+typedef struct AcRegionSample {
+    MEMORY_BASIC_INFORMATION memory;
+    AcRegionFinding finding;
+} AcRegionSample;
+
+static uint64_t ac_random_u64(uint64_t fallback)
+{
+    uint64_t value = 0;
+
+    if (BCryptGenRandom(
+            NULL,
+            (PUCHAR)&value,
+            (ULONG)sizeof(value),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        value = fallback ^ GetTickCount64();
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        value *= UINT64_C(2685821657736338717);
+    }
+    return value;
+}
 
 static bool ac_is_executable_protection(DWORD protection)
 {
@@ -263,9 +287,13 @@ void ac_policy_init_defaults(AcPolicy *policy)
     policy->probe_budget_bytes = 4ull * 1024ull * 1024ull;
     policy->scan_budget_ms = 250u;
     policy->repeat_interval_ms = 300000u;
+    policy->integrity_budget_bytes = 16ull * 1024ull * 1024ull;
+    policy->integrity_max_file_bytes = 64ull * 1024ull * 1024ull;
+    policy->integrity_baseline_budget_bytes = 64ull * 1024ull * 1024ull;
     policy->max_regions = 200000u;
     policy->hash_unknown_modules = true;
     policy->probe_region_content = true;
+    policy->verify_module_integrity = true;
 }
 
 bool ac_context_init(AcContext *context, AcLogger *logger, const AcPolicy *policy)
@@ -279,6 +307,7 @@ bool ac_context_init(AcContext *context, AcLogger *logger, const AcPolicy *polic
     context->policy = *policy;
     ac_module_list_init(&context->modules);
     ac_range_index_init(&context->module_ranges);
+    ac_integrity_cache_init(&context->integrity);
 
     return ac_dedup_init(&context->dedup, AC_DEDUP_CAPACITY, policy->repeat_interval_ms);
 }
@@ -290,6 +319,7 @@ void ac_context_free(AcContext *context)
     }
     ac_module_list_free(&context->modules);
     ac_range_index_free(&context->module_ranges);
+    ac_integrity_cache_free(&context->integrity);
     ac_dedup_free(&context->dedup);
     context->logger = NULL;
 }
@@ -610,7 +640,10 @@ static void ac_scan_memory_regions(
     SYSTEM_INFO system_info;
     uintptr_t address;
     uintptr_t maximum_address;
-    size_t region_events = 0;
+    AcRegionSample samples[AC_MAX_REGION_EVENTS_PER_SCAN];
+    size_t sample_count = 0;
+    uint64_t suspicious_seen = 0;
+    size_t sample_index;
 
     GetNativeSystemInfo(&system_info);
     address = (uintptr_t)system_info.lpMinimumApplicationAddress;
@@ -621,6 +654,7 @@ static void ac_scan_memory_regions(
         uintptr_t next_address;
 
         if (stats->regions_visited >= context->policy.max_regions) {
+            stats->region_scan_truncated = true;
             break;
         }
 
@@ -662,17 +696,46 @@ static void ac_scan_memory_regions(
             ++stats->executable_region_count;
 
             if (ac_classify_region(&memory, backed, &finding)) {
-                ++stats->suspicious_region_count;
+                size_t selected;
 
-                if (region_events < AC_MAX_REGION_EVENTS_PER_SCAN) {
-                    ac_probe_region(context, target->process, &memory, &finding, stats);
-                    ac_report_region(context, target->pid, scan_id, &memory, &finding, stats);
-                    ++region_events;
+                ++stats->suspicious_region_count;
+                ++suspicious_seen;
+
+                if (sample_count < AC_MAX_REGION_EVENTS_PER_SCAN) {
+                    selected = sample_count++;
+                } else {
+                    selected = (size_t)(ac_random_u64(
+                        (uint64_t)(uintptr_t)memory.BaseAddress) % suspicious_seen);
+                    if (selected >= AC_MAX_REGION_EVENTS_PER_SCAN) {
+                        address = next_address;
+                        continue;
+                    }
                 }
+                samples[selected].memory = memory;
+                samples[selected].finding = finding;
             }
         }
 
         address = next_address;
+    }
+
+    if (suspicious_seen > sample_count) {
+        stats->region_events_omitted = (size_t)(suspicious_seen - sample_count);
+    }
+    for (sample_index = 0; sample_index < sample_count; ++sample_index) {
+        ac_probe_region(
+            context,
+            target->process,
+            &samples[sample_index].memory,
+            &samples[sample_index].finding,
+            stats);
+        ac_report_region(
+            context,
+            target->pid,
+            scan_id,
+            &samples[sample_index].memory,
+            &samples[sample_index].finding,
+            stats);
     }
 }
 
@@ -686,7 +749,7 @@ bool ac_scan_process(
     DWORD error = ERROR_SUCCESS;
     ULONGLONG started_ms;
     size_t index;
-    char details[1024];
+    char details[2048];
 
     if (context == NULL || target == NULL || target->process == NULL || stats_out == NULL) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -726,9 +789,38 @@ bool ac_scan_process(
     }
 
     ac_scan_memory_regions(context, target, scan_id, &stats);
+    ac_verify_module_integrity(context, target, scan_id, &stats);
 
     stats.duration_ms = (uint64_t)(GetTickCount64() - started_ms);
     ++context->scans_completed;
+
+    if (context->modules.truncated ||
+        stats.region_scan_truncated ||
+        stats.region_events_omitted > 0 ||
+        stats.integrity_modules_partial > 0 ||
+        stats.integrity_modules_skipped > 0) {
+        (void)snprintf(
+            details,
+            sizeof(details),
+            "{\"scan_id\":%" PRIu64 ",\"module_list_truncated\":%s,"
+            "\"region_scan_truncated\":%s,\"region_events_omitted\":%zu,"
+            "\"integrity_modules_partial\":%zu,"
+            "\"integrity_modules_skipped\":%zu,"
+            "\"reason\":\"scan_coverage_incomplete\"}",
+            scan_id,
+            context->modules.truncated ? "true" : "false",
+            stats.region_scan_truncated ? "true" : "false",
+            stats.region_events_omitted,
+            stats.integrity_modules_partial,
+            stats.integrity_modules_skipped);
+        ac_log_event(
+            context->logger,
+            AC_SEVERITY_MEDIUM,
+            "scan_coverage_gap",
+            target->pid,
+            details);
+        ++stats.emitted;
+    }
 
     (void)snprintf(
         details,
@@ -739,7 +831,15 @@ bool ac_scan_process(
         "\"suspicious_regions\":%zu,\"query_failures\":%zu,\"read_failures\":%zu,"
         "\"probe_bytes\":%" PRIu64 ",\"events_emitted\":%" PRIu64 ","
         "\"events_suppressed\":%" PRIu64 ",\"dedup_entries\":%zu,"
-        "\"dedup_saturated_events\":%" PRIu64 "}",
+        "\"dedup_saturated_events\":%" PRIu64 ",\"integrity_modules_checked\":%zu,"
+        "\"integrity_modules_unavailable\":%zu,\"integrity_blocks_checked\":%zu,"
+        "\"integrity_blocks_modified\":%zu,\"integrity_unreadable_blocks\":%zu,"
+        "\"integrity_iat_slots_checked\":%zu,\"integrity_iat_hooks\":%zu,"
+        "\"integrity_export_slots_checked\":%zu,\"integrity_export_hooks\":%zu,"
+        "\"integrity_modules_partial\":%zu,\"integrity_modules_skipped\":%zu,"
+        "\"integrity_file_changes\":%zu,\"region_events_omitted\":%zu,"
+        "\"region_scan_truncated\":%s,\"integrity_bytes\":%" PRIu64
+        ",\"integrity_baselines\":%zu}",
         scan_id,
         stats.duration_ms,
         stats.module_count,
@@ -754,7 +854,23 @@ bool ac_scan_process(
         stats.emitted,
         stats.suppressed,
         context->dedup.used,
-        context->dedup.saturated_events);
+        context->dedup.saturated_events,
+        stats.integrity_modules_checked,
+        stats.integrity_modules_unavailable,
+        stats.integrity_blocks_checked,
+        stats.integrity_blocks_modified,
+        stats.integrity_unreadable_blocks,
+        stats.integrity_iat_slots_checked,
+        stats.integrity_iat_hooks,
+        stats.integrity_export_slots_checked,
+        stats.integrity_export_hooks,
+        stats.integrity_modules_partial,
+        stats.integrity_modules_skipped,
+        stats.integrity_file_changes,
+        stats.region_events_omitted,
+        stats.region_scan_truncated ? "true" : "false",
+        stats.integrity_bytes,
+        context->integrity.count);
     ac_log_event(context->logger, AC_SEVERITY_INFO, "scan_completed", target->pid, details);
 
     if (context->policy.scan_budget_ms > 0 &&

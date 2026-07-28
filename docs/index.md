@@ -23,6 +23,7 @@ enforcement.
 - [Contribution workflow](wiki/Contribution-Workflow.html)
 - [Driver ABI and lifecycle](driver-integration.html)
 - [Event schema](event-schema.html)
+- [Adversarial analysis](adversarial-analysis.html)
 - [Engineering project contract](project-board.html)
 
 ## Engineering coordination

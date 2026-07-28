@@ -1,0 +1,276 @@
+# Adversarial Analysis
+
+This document describes how an attacker defeats the current system, ordered by
+cost to the attacker. It is written from the attacker's side on purpose: a
+control that is not stated as evadable will be trusted as if it were not.
+
+Assumed attacker: a local user running arbitrary code at the same integrity
+level as the game, able to elevate to Administrator when the deployment allows
+it. This is the normal condition on a consumer machine.
+
+Status legend: **open** — no control exists; **partial** — detectable but
+evadable; **closed** — the documented attack no longer works.
+
+---
+
+## A. Attacks on the collector process
+
+### A1. Terminate or suspend the collector — *open*
+
+The collector is a separate user-mode process with a fixed image name. A
+process at the same integrity level may call `TerminateProcess`, suspend every
+thread with `NtSuspendProcess`, or close its log handle.
+
+Cost: minutes. Detection: none locally. The gap between `scan_completed`
+records is the only trace, and it is only visible to a system that expects a
+cadence.
+
+Countermeasure: the collector must not be the authority on its own liveness.
+Server-side session tracking with an expected heartbeat interval, plus
+`agent_stopped` correlation, converts termination into a missing-heartbeat
+signal. A watchdog service in a different session raises cost further but does
+not close the class while attacker and watchdog share a privilege level.
+
+### A2. Patch the collector's own code — *open*
+
+The collector emits its executable SHA-256 as
+`collector_identity_observed`, allowing deployment to reject an unexpected
+binary. Nothing continuously verifies the collector's mapped image. Patching
+`ac_report_region` or `ac_verify_module_integrity` to return immediately still
+produces a process that emits a well-formed, correctly chained, blind event
+stream.
+
+Cost: hours, once. Detection: none.
+
+Countermeasure: self-integrity using the same machinery this repository now
+applies to the target — validate the collector's own executable sections
+against its file on disk, and include the result in a periodic record. This
+raises the bar to "patch the check and the reporting path", but a local
+attacker with equal privilege can always win the final round. The durable
+control is remote: a server-issued nonce that the collector must answer with a
+hash over its own mapped code. Precompute is prevented by the nonce; the
+attacker must keep a pristine copy of the code and emulate the response, which
+is real work rather than a one-byte patch.
+
+### A3. Race the driver device — *partial*
+
+`AcTelemetry.sys` creates its device with `IoCreateDeviceSecure(..., TRUE, ...)`
+— exclusive. The first opener wins. An attacker who opens `\\.\AcTelemetry`
+before the collector denies it kernel telemetry entirely. Without
+`--require-kernel` the collector degrades to user-mode-only and logs
+`kernel_driver_open_failed` at severity `medium`.
+
+The device ACL is now `D:P(A;;GA;;;SY)`, so a normal Administrator token cannot
+open it directly. An attacker able to execute as `SYSTEM` can still win the
+exclusive-open race.
+
+Countermeasure: treat `kernel_driver_open_failed` as a session-integrity event
+rather than an operational warning, make `--require-kernel` the deployment
+default, and have the driver record the identity of the process that holds the
+device so a losing collector can report who won.
+
+### A4. Blind the driver through the IOCTL interface — *partial*
+
+Protocol v2 requires a nonzero random session ID. A different session cannot
+replace or clear an active registration, and target changes no longer clear the
+queue. Compromise of the collector process still exposes the active session ID
+and device handle, so this does not defend against an equal-privilege attacker
+inside the collector.
+
+Cost: minutes with Administrator. Detection: a `kernel_target_changed` record
+appears, but nothing marks it as unexpected.
+
+Countermeasure: issue #11. Bind registration to a launcher-created session with
+a server-issued identifier, reject a target change that does not present the
+current session token, and never silently drop queued events on
+re-registration.
+
+---
+
+## B. Attacks on evidence
+
+### B1. Delete the log — *partial*
+
+The chain detects modification of retained records. It does not survive
+deletion of the whole file, and the seed is generated locally, so an attacker
+can produce a fresh, internally consistent, fully verifiable log of a clean
+session.
+
+Countermeasure: issue #14. Forward the sequence number and chain head to
+append-only remote storage during the session. The value of the chain is that
+it makes the *server's* copy authoritative — locally it proves nothing.
+
+### B2. Flood the kernel queue — *partial*
+
+The driver queue holds 512 events and overwrites the oldest on overflow. An
+attacker who loads and unloads modules in a loop pushes the record of their own
+injection out of the queue before the collector drains it. `events_dropped`
+increases, which is reported as `kernel_event_queue_overflow` at severity
+`medium`.
+
+Countermeasure: an overflow during a session is evidence destruction, not an
+operational nuisance. It is now `medium` and requires a server-side rule. The
+collector drains every 250 milliseconds while waiting for the next user-mode
+scan, reducing but not eliminating the overflow window.
+
+### B3. Flood user-mode findings — *partial*
+
+`ac_scan_memory_regions` reports at most `AC_MAX_REGION_EVENTS_PER_SCAN` (64)
+regions. It now uses reservoir sampling, so low-address allocations cannot
+deterministically exclude a high-address payload. The omitted count is emitted
+as `scan_coverage_gap`. Flooding still reduces the probability that any one
+region is sampled. The same applies to the 4 MiB probe budget and the 16 MiB
+integrity budget.
+
+Countermeasure: the caps are necessary, but hitting them must be reported as a
+finding rather than applied silently, and the scan order must be randomised so
+an attacker cannot rely on address ordering to hide.
+
+### B4. Saturate the de-duplication table — *partial*
+
+The table holds 4096 fingerprints and fails open when saturated, which is the
+right default. An attacker who forces saturation converts a quiet log into a
+noisy one and buries a real finding in volume.
+
+Countermeasure: `dedup_saturated_events` is already reported; it needs a
+server-side rule, not more code.
+
+---
+
+## C. Attacks on detection logic
+
+### C1. Drop the payload into an allowed root — *open*
+
+`module_outside_allowed_roots` classifies by directory. Game directories are
+frequently writable by the user who runs the game. A DLL written next to the
+game executable is classified as expected. The collector now emits
+`module_identity_observed` with SHA-256 and stable file identity for every
+loader-visible module, including modules inside allowed roots, but no signed
+manifest is enforced locally yet.
+
+This is the cheapest bypass in the system: copy the payload into the game
+folder and load it normally.
+
+Countermeasure: issue #12. The server must compare `module_identity_observed`
+with a signed manifest; directory membership is not authorization.
+
+### C2. Erase the PE header of a manual-mapped image — *partial*
+
+The bounded probe raises severity to `high` on a valid `MZ`/`PE` header in
+unbacked memory. Zeroing the first page after mapping removes that signal; the
+region is then fingerprinted by reason, protection, and size bucket, which
+collapses it into the same bucket as ordinary JIT output.
+
+Countermeasure: header erasure is itself anomalous. A private executable region
+whose first page is entirely zero, or whose entropy profile does not match
+compiled code, is a stronger signal than the absence of a header. Section-shape
+heuristics belong here.
+
+### C3. Time the scan window — *partial*
+
+The collector randomises each wait by plus or minus 20 percent around
+`--interval-ms`, so the next scan cannot be predicted from the configured base
+interval. A payload that maps, executes, and unmaps entirely between two scans
+can still remain unobserved. The default base interval is five seconds.
+
+Countermeasure: randomised intervals so the window is not predictable, and
+event-driven collection — the kernel image-load callback already provides one —
+rather than polling alone. Polling can only ever find what is still resident.
+
+### C4. Restore before the scan — *partial for inline hooks*
+
+Against the region scanner, a cheat can restore original page protections
+before each poll. Against the integrity check added for issue #13 this is
+harder: restoring means writing the original bytes back, which removes the hook
+for the duration. That is the intended effect — the control does not stop the
+hook, it makes the hook expensive to keep resident.
+
+Remaining gap: the check runs on a round-robin cursor with a byte budget, so a
+given module is validated every N scans, not every scan. A cheat that hooks,
+acts, and unhooks within that window survives.
+
+Countermeasure: prioritise the cursor by module risk — the main executable and
+the modules a cheat must hook to be useful — instead of round-robin over all
+modules equally.
+
+### C5. Hook without modifying section bytes — *open*
+
+The integrity check compares section content and validates IAT and EAT targets.
+It does not cover:
+
+- indirect dispatch through function pointers in writable data (`.data`,
+  `.rdata` after `VirtualProtect`, vtables, callback registrations);
+- return-oriented payloads that execute only existing bytes;
+- the Control Flow Guard dispatch table;
+- exception-handler tables and TLS callbacks;
+- `KUSER_SHARED_DATA` and PEB-derived dispatch.
+
+Countermeasure: extend validation to non-executable sections that hold dispatch
+metadata. Vtable and callback validation is a large surface and belongs in a
+later milestone; state the gap rather than implying full coverage.
+
+### C6. Modify the file on disk after load — *partial*
+
+`ac_hash_file` still hashes a path rather than the mapped section object.
+Integrity baselines now retain volume serial, file index, size, and write time;
+a change emits `module_file_identity_changed`, invalidates the cache, and
+rebuilds the baseline. A replacement completed before the first baseline is
+still indistinguishable without the signed manifest.
+
+Countermeasure: derive identity from the mapped section rather than the path —
+open the file by its file ID, or read the image from memory and compare against
+a manifest entry rather than against the current file on disk.
+
+### C7. Load before the collector attaches — *open*
+
+The user-mode scan sees a snapshot. Anything injected before the collector
+starts is indistinguishable from a legitimately loaded module unless it fails
+another check.
+
+Countermeasure: issue #11's create-suspended launcher sequence. Registration
+must complete before the initial thread resumes.
+
+---
+
+## D. What issue #13 changes
+
+Before: a cheat that loads a normal DLL and installs inline hooks in
+`game.exe`'s `.text` produced no finding at all. The module list was intact,
+the memory was image-backed, and no rule looked at content.
+
+After: the modified block is reported at `high` with the exact RVA, the
+expected and observed digests, and the differing bytes.
+
+The attacker's cheapest responses, in order:
+
+1. Move the hook to a data pointer instead of code (C5) — not covered.
+2. Hook only inside the interval where the module is not being validated
+   (C4) — partially covered.
+3. Drop the payload into an allowed root and hook from there — the hook is
+   still detected; only the module classification is defeated (C1).
+4. Patch the collector instead of the game (A2) — not covered.
+
+Item 4 remains the dominant strategy, which is why collector self-integrity and
+remote attestation rank above further detection work in the roadmap.
+
+---
+
+## E. Priority
+
+Ranked by attacker cost imposed per unit of engineering effort:
+
+| Rank | Work | Closes | Issue |
+| --- | --- | --- | --- |
+| 1 | Remote chain anchoring and heartbeat | B1, A1 | #14 |
+| 2 | Session-bound target registration | A4, C7 | #11 |
+| 3 | Signed identity manifest | C1, C6 | #12 |
+| 4 | Collector self-integrity with server nonce | A2 | — |
+| 5 | Randomised scan order and interval | B3, C3 | — |
+| 6 | Risk-ordered integrity cursor | C4 | — |
+| 7 | Dispatch-metadata validation | C5 | — |
+
+Items 4, 5, and 6 have no issue yet and should get one.
+
+No item in this table makes user-mode detection unevadable. They raise the cost
+from "one afternoon" to "sustained engineering", which is the only honest goal
+for a Ring 3 sensor.

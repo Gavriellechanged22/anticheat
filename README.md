@@ -49,8 +49,8 @@ integrator-owned storage, transport, correlation, and policy
 
 The driver and collector use the shared ABI defined in
 [`include/ac_driver_protocol.h`](include/ac_driver_protocol.h). The driver
-device is exclusive and accessible only to `SYSTEM` and local
-`Administrators`.
+device is exclusive and accessible only to `SYSTEM`. Protocol v2 binds target
+registration to a cryptographically random collector session identifier.
 
 ## Supported configurations
 
@@ -112,10 +112,12 @@ core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer
 
 ### Automated test inventory
 
-Windows builds register 24 independent CTest cases: 10 portable algorithms,
-11 Windows collector/core behaviors, and 3 CLI contracts. Non-Windows builds
-register the 10 portable cases. Each entry runs one unique test function or
-contract so a failure identifies the affected subsystem directly.
+Windows builds register 36 independent CTest cases: 17 portable algorithms,
+16 Windows collector/core behaviors, and 3 CLI contracts. macOS builds register
+21 cases: the 17 portable cases, 3 CLI contracts, and one live self-scan.
+Linux sanitizer builds register the 17 portable cases. Each entry runs one
+unique test function or contract so a failure identifies the affected subsystem
+directly.
 
 List the registered cases without executing them:
 
@@ -251,10 +253,9 @@ Require an operational kernel driver:
 the protocol version is incompatible, target registration fails, or event
 reads fail.
 
-The driver device ACL requires the collector to run as `SYSTEM` or as an
-administrator when kernel telemetry is enabled. User-mode-only collection does
-not require administrative privileges when the target process ACL permits
-read access.
+The driver device ACL requires the collector to run as `SYSTEM` when kernel
+telemetry is enabled. User-mode-only collection does not require administrative
+privileges when the target process ACL permits read access.
 
 ## Integration sequence
 
@@ -285,7 +286,7 @@ state at the next scan.
 | `--process <name>` | Resolve a target by executable name. |
 | `--pid <id>` | Select an explicit target PID. Preferred for integration. |
 | `--wait-timeout-ms <n>` | Stop waiting for a named process after `n` milliseconds. |
-| `--interval-ms <n>` | User-mode scan interval, `1000..3600000`. |
+| `--interval-ms <n>` | Base user-mode scan interval, `1000..3600000`; each wait is jittered by up to 20 percent. |
 | `--once` | Run one user-mode scan and exit. |
 | `--allow-root <dir>` | Add an expected module root. Repeatable. |
 | `--kernel` | Consume driver events when the driver is available. |
@@ -309,8 +310,8 @@ The output is a stable, line-oriented contract:
 
 ```text
 collector_version=0.3.0
-event_schema_version=3
-driver_protocol_version=1
+event_schema_version=4
+driver_protocol_version=2
 ```
 
 Integrators must parse the keys rather than depend on a fixed numeric value.
@@ -335,7 +336,7 @@ The driver exposes `\\.\AcTelemetry` and supports:
 | IOCTL | Direction | Purpose |
 | --- | --- | --- |
 | `IOCTL_AC_GET_VERSION` | Driver to client | Return protocol and structure versions. |
-| `IOCTL_AC_SET_TARGET` | Client to driver | Register or clear one target PID. |
+| `IOCTL_AC_SET_TARGET` | Client to driver | Register or clear one target PID for the current random session ID. |
 | `IOCTL_AC_READ_EVENTS` | Driver to client | Return up to 32 queued fixed-size events. |
 | `IOCTL_AC_GET_STATS` | Driver to client | Return queue depth, dropped-event count, and callback state. |
 
@@ -385,8 +386,10 @@ python tools\verify_log.py `
 - The driver queue contains 512 events and overwrites the oldest event when
   full. Every overwrite increments `events_dropped`.
 - A read returns at most 32 events. The collector drains at most eight batches
-  per scan iteration to bound CPU usage.
+  every 250 milliseconds while waiting for the next user-mode scan.
 - Only one device handle is allowed at a time.
+- Target changes preserve queued evidence. A different session ID cannot replace
+  or clear an active registration.
 - Target registration is PID-based. The collector separately validates target
   image path and process creation time.
 - The driver reports image loads for the active PID, direct child-process
@@ -415,8 +418,10 @@ src/
   kernel_client.c         user-mode driver client
   process.c               target discovery and identity validation
   scanner.c               module and memory telemetry
+  integrity.c             PE section, import and export validation
   log.c                   JSONL output, rotation, integrity chain
   dedup.c                 bounded finding de-duplication
+  pe.c                    bounds-checked PE parser and loader normalisation
   ranges.c                executable range index
   sha256.c                SHA-256 implementation
   text.c                  JSON escaping and fingerprints
@@ -431,6 +436,7 @@ tools/
 
 - [Driver integration](docs/driver-integration.md)
 - [Event schema](docs/event-schema.md)
+- [Adversarial analysis](docs/adversarial-analysis.md)
 - [Security model](SECURITY.md)
 - [Technical roadmap](ROADMAP.md)
 - [Engineering project contract](docs/project-board.md)

@@ -32,8 +32,9 @@ The driver registers documented process and image-load callbacks for one
 active target PID. It stores fixed-size records in a preallocated queue and
 does not perform target-memory scanning in callback context.
 
-The device is exclusive and restricted to `SYSTEM` and local Administrators.
-All requests use fixed-size structures and `METHOD_BUFFERED`.
+The device is exclusive and restricted to `SYSTEM`. Target registration is
+bound to a random protocol session ID. All requests use fixed-size structures
+and `METHOD_BUFFERED`.
 
 ## User boundary
 

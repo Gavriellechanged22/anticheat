@@ -1,5 +1,6 @@
 #include "ac.h"
 
+#include <bcrypt.h>
 #include <inttypes.h>
 #include <string.h>
 
@@ -34,6 +35,18 @@ bool ac_kernel_client_open(AcKernelClient *client)
         FILE_ATTRIBUTE_NORMAL,
         NULL);
     if (client->device == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    if (BCryptGenRandom(
+            NULL,
+            (PUCHAR)&client->session_id,
+            (ULONG)sizeof(client->session_id),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ||
+        client->session_id == 0) {
+        const DWORD error = ERROR_GEN_FAILURE;
+        ac_kernel_client_close(client);
+        SetLastError(error);
         return false;
     }
 
@@ -74,6 +87,9 @@ void ac_kernel_client_close(AcKernelClient *client)
 
     if (client->device != NULL &&
         client->device != INVALID_HANDLE_VALUE) {
+        if (client->session_id != 0 && client->session_registered) {
+            (void)ac_kernel_client_set_target(client, 0);
+        }
         CloseHandle(client->device);
     }
     ac_kernel_client_init(client);
@@ -95,16 +111,21 @@ bool ac_kernel_client_set_target(AcKernelClient *client, DWORD pid)
     request.size = (uint32_t)sizeof(request);
     request.protocol_version = AC_DRIVER_PROTOCOL_VERSION;
     request.target_pid = (uint32_t)pid;
+    request.session_id = client->session_id;
 
-    return DeviceIoControl(
-               client->device,
-               IOCTL_AC_SET_TARGET,
-               &request,
-               (DWORD)sizeof(request),
-               NULL,
-               0,
-               &returned,
-               NULL) != FALSE;
+    if (!DeviceIoControl(
+            client->device,
+            IOCTL_AC_SET_TARGET,
+            &request,
+            (DWORD)sizeof(request),
+            NULL,
+            0,
+            &returned,
+            NULL)) {
+        return false;
+    }
+    client->session_registered = pid != 0;
+    return true;
 }
 
 bool ac_kernel_client_get_stats(
@@ -136,7 +157,9 @@ bool ac_kernel_client_get_stats(
     if (returned != (DWORD)sizeof(*stats_out) ||
         stats_out->size != (uint32_t)sizeof(*stats_out) ||
         stats_out->protocol_version !=
-            AC_DRIVER_PROTOCOL_VERSION) {
+            AC_DRIVER_PROTOCOL_VERSION ||
+        (stats_out->session_id != 0 &&
+         stats_out->session_id != client->session_id)) {
         SetLastError(ERROR_INVALID_DATA);
         return false;
     }
@@ -304,7 +327,7 @@ bool ac_kernel_client_drain(
                 stats.queue_capacity);
             ac_log_event(
                 logger,
-                AC_SEVERITY_LOW,
+                AC_SEVERITY_MEDIUM,
                 "kernel_event_queue_overflow",
                 target_pid,
                 details);

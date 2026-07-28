@@ -301,6 +301,10 @@ static void test_policy_defaults(void)
     AC_CHECK(policy.max_regions > 0);
     AC_CHECK(policy.hash_unknown_modules);
     AC_CHECK(policy.probe_region_content);
+    AC_CHECK(policy.verify_module_integrity);
+    AC_CHECK(policy.integrity_budget_bytes > 0);
+    AC_CHECK(policy.integrity_max_file_bytes > 0);
+    AC_CHECK(policy.integrity_baseline_budget_bytes > 0);
 }
 
 static void test_open_process_uses_read_only_access(void)
@@ -380,6 +384,337 @@ static void test_scan_of_self_produces_events(void)
     (void)_wremove(path);
 }
 
+/* External linkage keeps the compiler from discarding the function whose
+   first byte the integrity test deliberately corrupts. */
+int ac_test_patch_victim(int value);
+
+int ac_test_patch_victim(int value)
+{
+    return (value * 7) + 13;
+}
+
+typedef struct AcIntegrityFixture {
+    AcLogger logger;
+    AcContext context;
+    AcPolicy policy;
+    AcTarget target;
+    wchar_t log_path[MAX_PATH];
+    wchar_t windows_directory[MAX_PATH];
+    bool ready;
+} AcIntegrityFixture;
+
+static bool ac_test_integrity_setup(AcIntegrityFixture *fixture, const wchar_t *stem)
+{
+    memset(fixture, 0, sizeof(*fixture));
+
+    if (!ac_temp_log_path(
+            fixture->log_path,
+            sizeof(fixture->log_path) / sizeof(fixture->log_path[0]),
+            stem)) {
+        return false;
+    }
+    (void)_wremove(fixture->log_path);
+
+    fixture->target.pid = GetCurrentProcessId();
+    fixture->target.process = ac_open_process_for_scan(
+        fixture->target.pid,
+        &fixture->target.granted_access);
+    if (fixture->target.process == NULL) {
+        return false;
+    }
+
+    if (!ac_get_process_path(fixture->target.process, &fixture->target.image_path) ||
+        !ac_get_parent_directory(fixture->target.image_path, &fixture->target.directory)) {
+        return false;
+    }
+
+    fixture->windows_directory[0] = L'\0';
+    (void)GetWindowsDirectoryW(
+        fixture->windows_directory,
+        (UINT)(sizeof(fixture->windows_directory) /
+               sizeof(fixture->windows_directory[0])));
+
+    ac_policy_init_defaults(&fixture->policy);
+    fixture->policy.allow_root_count = 2u;
+    fixture->policy.allow_roots[0] = fixture->target.directory;
+    fixture->policy.allow_roots[1] = fixture->windows_directory;
+    fixture->policy.integrity_budget_bytes = 256ull * 1024ull * 1024ull;
+    fixture->policy.probe_region_content = false;
+    fixture->policy.hash_unknown_modules = false;
+    fixture->policy.repeat_interval_ms = 0;
+
+    if (!ac_logger_open(&fixture->logger, fixture->log_path, false, 0, 0)) {
+        return false;
+    }
+    if (!ac_context_init(&fixture->context, &fixture->logger, &fixture->policy)) {
+        return false;
+    }
+
+    fixture->ready = true;
+    return true;
+}
+
+static void ac_test_integrity_teardown(AcIntegrityFixture *fixture)
+{
+    if (fixture->ready) {
+        ac_context_free(&fixture->context);
+        ac_logger_close(&fixture->logger);
+    }
+    if (fixture->target.process != NULL) {
+        CloseHandle(fixture->target.process);
+    }
+    free(fixture->target.image_path);
+    free(fixture->target.directory);
+    (void)_wremove(fixture->log_path);
+}
+
+static bool ac_test_log_contains(const wchar_t *path, const char *needle)
+{
+    FILE *file = _wfopen(path, L"rb");
+    char line[32768];
+
+    if (file == NULL) {
+        return false;
+    }
+    while (fgets(line, (int)sizeof(line), file) != NULL) {
+        if (strstr(line, needle) != NULL) {
+            (void)fclose(file);
+            return true;
+        }
+    }
+    (void)fclose(file);
+    return false;
+}
+
+static bool ac_test_log_contains_both(
+    const wchar_t *path,
+    const char *first,
+    const char *second)
+{
+    FILE *file = _wfopen(path, L"rb");
+    char line[32768];
+
+    if (file == NULL) {
+        return false;
+    }
+    while (fgets(line, (int)sizeof(line), file) != NULL) {
+        if (strstr(line, first) != NULL && strstr(line, second) != NULL) {
+            (void)fclose(file);
+            return true;
+        }
+    }
+    (void)fclose(file);
+    return false;
+}
+
+/* A clean process must produce no section findings: this is the false-positive
+   guard for relocation, import and delay-import normalisation. */
+static void test_integrity_clean_process_has_no_findings(void)
+{
+    AcIntegrityFixture fixture;
+    AcScanStats stats;
+    char path_utf8[MAX_PATH * 3];
+    char escaped_path[MAX_PATH * 6];
+    char path_needle[MAX_PATH * 6 + 16];
+
+    if (!ac_test_integrity_setup(&fixture, L"ac-int-clean")) {
+        AC_CHECK(false);
+        ac_test_integrity_teardown(&fixture);
+        return;
+    }
+
+    memset(&stats, 0, sizeof(stats));
+    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &stats));
+
+    AC_CHECK(stats.integrity_modules_checked > 0);
+    AC_CHECK(stats.integrity_blocks_checked > 0);
+    AC_CHECK(stats.integrity_bytes > 0);
+    AC_CHECK(stats.integrity_iat_slots_checked > 0);
+    AC_CHECK(stats.integrity_iat_hooks == 0);
+    AC_CHECK(stats.integrity_export_hooks == 0);
+    AC_CHECK(fixture.context.integrity.count > 0);
+    AC_CHECK(ac_wide_to_utf8(
+        fixture.target.image_path,
+        path_utf8,
+        sizeof(path_utf8)));
+    AC_CHECK(ac_json_escape(path_utf8, escaped_path, sizeof(escaped_path)));
+    (void)snprintf(
+        path_needle,
+        sizeof(path_needle),
+        "\"path\":\"%s\"",
+        escaped_path);
+    AC_CHECK(!ac_test_log_contains_both(
+        fixture.log_path,
+        "\"event\":\"module_section_modified\"",
+        path_needle));
+
+    /* Baselines are cached, so a second pass must not re-read any file. */
+    {
+        const uint64_t allocated = fixture.context.integrity.bytes_allocated;
+        AcScanStats second;
+
+        memset(&second, 0, sizeof(second));
+        AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 2u, &second));
+        AC_CHECK(fixture.context.integrity.bytes_allocated == allocated);
+        AC_CHECK(second.integrity_blocks_checked > 0);
+    }
+
+    ac_test_integrity_teardown(&fixture);
+}
+
+/* Acceptance criterion: a single modified instruction byte in .text must be
+   reported with the exact RVA it occupies. */
+static void test_integrity_reports_patched_text_rva(void)
+{
+    AcIntegrityFixture fixture;
+    AcScanStats before;
+    AcScanStats after;
+    int (*volatile victim_pointer)(int) = ac_test_patch_victim;
+    uint8_t *victim = (uint8_t *)(void *)(uintptr_t)victim_pointer;
+    const uintptr_t module_base = (uintptr_t)GetModuleHandleW(NULL);
+    const uint32_t victim_rva = (uint32_t)((uintptr_t)victim - module_base);
+    DWORD original_protection = 0;
+    uint8_t original_byte;
+    bool patched = false;
+    char needle[64];
+    char line[32768];
+    FILE *file;
+    bool found_rva = false;
+    bool found_event = false;
+
+    if (!ac_test_integrity_setup(&fixture, L"ac-int-patch")) {
+        AC_CHECK(false);
+        ac_test_integrity_teardown(&fixture);
+        return;
+    }
+
+    memset(&before, 0, sizeof(before));
+    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &before));
+    AC_CHECK(before.integrity_blocks_checked > 0);
+
+    if (VirtualProtect(victim, 1u, PAGE_EXECUTE_READWRITE, &original_protection)) {
+        original_byte = victim[0];
+        victim[0] = (uint8_t)(original_byte ^ 0xffu);
+        FlushInstructionCache(GetCurrentProcess(), victim, 1u);
+        patched = true;
+
+        memset(&after, 0, sizeof(after));
+        AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 2u, &after));
+
+        victim[0] = original_byte;
+        FlushInstructionCache(GetCurrentProcess(), victim, 1u);
+        {
+            DWORD restored = 0;
+            (void)VirtualProtect(victim, 1u, original_protection, &restored);
+        }
+
+        AC_CHECK(after.integrity_blocks_modified > before.integrity_blocks_modified);
+    }
+
+    AC_CHECK(patched);
+    if (!patched) {
+        ac_test_integrity_teardown(&fixture);
+        return;
+    }
+
+    AC_CHECK(ac_test_patch_victim(3) == 34);
+
+    (void)snprintf(needle, sizeof(needle), "\"modified_rva\":\"0x%08x\"", victim_rva);
+
+    file = _wfopen(fixture.log_path, L"rb");
+    AC_CHECK(file != NULL);
+    if (file != NULL) {
+        while (fgets(line, (int)sizeof(line), file) != NULL) {
+            if (strstr(line, "\"event\":\"module_section_modified\"") == NULL) {
+                continue;
+            }
+            found_event = true;
+            if (strstr(line, needle) != NULL) {
+                found_rva = true;
+                AC_CHECK(strstr(line, "\"severity\":\"high\"") != NULL);
+                AC_CHECK(strstr(line, "\"expected_sha256\"") != NULL);
+                AC_CHECK(strstr(line, "\"observed_sha256\"") != NULL);
+                AC_CHECK(strstr(line, "\"verdict\":\"signal_only\"") != NULL);
+                break;
+            }
+        }
+        (void)fclose(file);
+    }
+
+    AC_CHECK(found_event);
+    AC_CHECK(found_rva);
+
+    ac_test_integrity_teardown(&fixture);
+}
+
+static void test_integrity_reports_every_module_identity(void)
+{
+    AcIntegrityFixture fixture;
+    AcScanStats stats;
+
+    if (!ac_test_integrity_setup(&fixture, L"ac-int-identity")) {
+        AC_CHECK(false);
+        ac_test_integrity_teardown(&fixture);
+        return;
+    }
+
+    memset(&stats, 0, sizeof(stats));
+    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &stats));
+    AC_CHECK(stats.integrity_modules_checked > 0);
+    AC_CHECK(ac_test_log_contains(
+        fixture.log_path,
+        "\"event\":\"module_identity_observed\""));
+    AC_CHECK(ac_test_log_contains(fixture.log_path, "\"file_sha256\":\""));
+    AC_CHECK(ac_test_log_contains(fixture.log_path, "\"file_index\":"));
+
+    ac_test_integrity_teardown(&fixture);
+}
+
+static void test_integrity_budget_exhaustion_is_reported(void)
+{
+    AcIntegrityFixture fixture;
+    AcScanStats stats;
+
+    if (!ac_test_integrity_setup(&fixture, L"ac-int-budget")) {
+        AC_CHECK(false);
+        ac_test_integrity_teardown(&fixture);
+        return;
+    }
+
+    fixture.context.policy.integrity_budget_bytes = 0;
+    memset(&stats, 0, sizeof(stats));
+    AC_CHECK(ac_scan_process(&fixture.context, &fixture.target, 1u, &stats));
+    AC_CHECK(stats.integrity_modules_skipped > 0);
+    AC_CHECK(stats.integrity_modules_checked == 0);
+    AC_CHECK(ac_test_log_contains(
+        fixture.log_path,
+        "\"event\":\"scan_coverage_gap\""));
+    AC_CHECK(ac_test_log_contains(
+        fixture.log_path,
+        "\"reason\":\"scan_coverage_incomplete\""));
+
+    ac_test_integrity_teardown(&fixture);
+}
+
+static void test_driver_protocol_session_layout(void)
+{
+    AcDriverTargetRequest request;
+    AcDriverStats stats;
+
+    memset(&request, 0, sizeof(request));
+    memset(&stats, 0, sizeof(stats));
+    request.size = (uint32_t)sizeof(request);
+    request.protocol_version = AC_DRIVER_PROTOCOL_VERSION;
+    request.target_pid = 42u;
+    request.session_id = UINT64_C(0x0102030405060708);
+
+    AC_CHECK(AC_DRIVER_PROTOCOL_VERSION == 2u);
+    AC_CHECK(sizeof(request) == 24u);
+    AC_CHECK(sizeof(stats) == 56u);
+    AC_CHECK(request.session_id != 0);
+    AC_CHECK(request.reserved == 0);
+}
+
 typedef void (*AcCoreTestFunction)(void);
 
 typedef struct AcCoreTestCase {
@@ -398,7 +733,12 @@ static const AcCoreTestCase g_test_cases[] = {
     {"log_rotation", test_log_rotation},
     {"policy_defaults", test_policy_defaults},
     {"least_privilege_process_access", test_open_process_uses_read_only_access},
-    {"self_scan", test_scan_of_self_produces_events}
+    {"self_scan", test_scan_of_self_produces_events},
+    {"integrity_clean_process", test_integrity_clean_process_has_no_findings},
+    {"integrity_patched_text", test_integrity_reports_patched_text_rva},
+    {"integrity_module_identity", test_integrity_reports_every_module_identity},
+    {"integrity_budget_gap", test_integrity_budget_exhaustion_is_reported},
+    {"driver_protocol_session", test_driver_protocol_session_layout}
 };
 
 int main(int argc, char **argv)

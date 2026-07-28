@@ -10,7 +10,7 @@
 #include <winioctl.h>
 #endif
 
-#define AC_DRIVER_PROTOCOL_VERSION 1u
+#define AC_DRIVER_PROTOCOL_VERSION 2u
 #define AC_DRIVER_QUEUE_CAPACITY 512u
 #define AC_DRIVER_MAX_BATCH_EVENTS 32u
 #define AC_DRIVER_IMAGE_PATH_CHARS 260u
@@ -57,6 +57,7 @@ typedef struct AcDriverTargetRequest {
     uint32_t protocol_version;
     uint32_t target_pid;
     uint32_t reserved;
+    uint64_t session_id;
 } AcDriverTargetRequest;
 
 typedef struct AcDriverStats {
@@ -69,6 +70,7 @@ typedef struct AcDriverStats {
     uint32_t queue_depth;
     uint32_t queue_capacity;
     uint32_t callbacks_active;
+    uint64_t session_id;
 } AcDriverStats;
 
 typedef struct AcDriverEvent {
@@ -91,8 +93,8 @@ typedef struct AcDriverEvent {
 
 #if defined(__cplusplus)
 static_assert(sizeof(AcDriverVersion) == 16u, "protocol layout mismatch");
-static_assert(sizeof(AcDriverTargetRequest) == 16u, "protocol layout mismatch");
-static_assert(sizeof(AcDriverStats) == 48u, "protocol layout mismatch");
+static_assert(sizeof(AcDriverTargetRequest) == 24u, "protocol layout mismatch");
+static_assert(sizeof(AcDriverStats) == 56u, "protocol layout mismatch");
 static_assert(sizeof(AcDriverEvent) == 584u, "protocol layout mismatch");
 static_assert(IOCTL_AC_GET_VERSION != IOCTL_AC_SET_TARGET,
               "IOCTL values must be unique");
@@ -103,8 +105,8 @@ static_assert(IOCTL_AC_READ_EVENTS != IOCTL_AC_GET_STATS,
 #elif defined(_MSC_VER) || \
       (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
 _Static_assert(sizeof(AcDriverVersion) == 16u, "protocol layout mismatch");
-_Static_assert(sizeof(AcDriverTargetRequest) == 16u, "protocol layout mismatch");
-_Static_assert(sizeof(AcDriverStats) == 48u, "protocol layout mismatch");
+_Static_assert(sizeof(AcDriverTargetRequest) == 24u, "protocol layout mismatch");
+_Static_assert(sizeof(AcDriverStats) == 56u, "protocol layout mismatch");
 _Static_assert(sizeof(AcDriverEvent) == 584u, "protocol layout mismatch");
 _Static_assert(IOCTL_AC_GET_VERSION != IOCTL_AC_SET_TARGET,
                "IOCTL values must be unique");

@@ -19,6 +19,7 @@ typedef struct AcDeviceExtension {
     ULONG head;
     ULONG count;
     ULONG target_pid;
+    ULONGLONG session_id;
     ULONGLONG next_sequence;
     ULONGLONG events_generated;
     ULONGLONG events_dropped;
@@ -248,6 +249,18 @@ static NTSTATUS AcSetTarget(
     AcDriverEvent event;
     NTSTATUS status;
 
+    if (request->session_id == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&g_extension->lock, &old_irql);
+    if (g_extension->session_id != 0 &&
+        g_extension->session_id != request->session_id) {
+        KeReleaseSpinLock(&g_extension->lock, old_irql);
+        return STATUS_ACCESS_DENIED;
+    }
+    KeReleaseSpinLock(&g_extension->lock, old_irql);
+
     if (request->target_pid != 0) {
         status = PsLookupProcessByProcessId(
             (HANDLE)(ULONG_PTR)request->target_pid,
@@ -259,9 +272,16 @@ static NTSTATUS AcSetTarget(
     }
 
     KeAcquireSpinLock(&g_extension->lock, &old_irql);
+    if (g_extension->session_id != 0 &&
+        g_extension->session_id != request->session_id) {
+        KeReleaseSpinLock(&g_extension->lock, old_irql);
+        return STATUS_ACCESS_DENIED;
+    }
+    g_extension->session_id = request->session_id;
     g_extension->target_pid = request->target_pid;
-    g_extension->head = 0;
-    g_extension->count = 0;
+    if (request->target_pid == 0) {
+        g_extension->session_id = 0;
+    }
     KeReleaseSpinLock(&g_extension->lock, old_irql);
 
     RtlZeroMemory(&event, sizeof(event));
@@ -313,6 +333,7 @@ static VOID AcGetStats(AcDriverStats *stats)
     stats->callbacks_active =
         (g_extension->process_callback_registered ? 1u : 0u) |
         (g_extension->image_callback_registered ? 2u : 0u);
+    stats->session_id = g_extension->session_id;
     KeReleaseSpinLock(&g_extension->lock, old_irql);
 }
 
@@ -459,7 +480,7 @@ NTSTATUS DriverEntry(
         RTL_CONSTANT_STRING(AC_DRIVER_DOS_DEVICE_NAME);
     UNICODE_STRING security_descriptor =
         RTL_CONSTANT_STRING(
-            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+            L"D:P(A;;GA;;;SY)");
     PDEVICE_OBJECT device_object = NULL;
     NTSTATUS status;
     ULONG index;

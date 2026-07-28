@@ -31,12 +31,12 @@ classification, JSON serialization, and remote integration.
 | Transfer method | `METHOD_BUFFERED` |
 | Handle mode | Exclusive |
 | Device characteristic | `FILE_DEVICE_SECURE_OPEN` |
-| Device ACL | `SYSTEM` and built-in `Administrators`: full access |
+| Device ACL | `SYSTEM`: full access |
 
 Security descriptor:
 
 ```text
-D:P(A;;GA;;;SY)(A;;GA;;;BA)
+D:P(A;;GA;;;SY)
 ```
 
 The device is created through `IoCreateDeviceSecure` with a project-specific
@@ -47,7 +47,7 @@ class GUID.
 Current protocol:
 
 ```c
-#define AC_DRIVER_PROTOCOL_VERSION 1u
+#define AC_DRIVER_PROTOCOL_VERSION 2u
 ```
 
 The following structure sizes are part of the ABI:
@@ -55,8 +55,8 @@ The following structure sizes are part of the ABI:
 | Structure | Size |
 | --- | --- |
 | `AcDriverVersion` | 16 bytes |
-| `AcDriverTargetRequest` | 16 bytes |
-| `AcDriverStats` | 48 bytes |
+| `AcDriverTargetRequest` | 24 bytes |
+| `AcDriverStats` | 56 bytes |
 | `AcDriverEvent` | 584 bytes |
 
 The shared header contains compile-time size assertions. All structures use
@@ -107,6 +107,7 @@ typedef struct AcDriverTargetRequest {
     uint32_t protocol_version;
     uint32_t target_pid;
     uint32_t reserved;
+    uint64_t session_id;
 } AcDriverTargetRequest;
 ```
 
@@ -115,11 +116,13 @@ Rules:
 - `size` must match the current structure size;
 - `protocol_version` must match;
 - `reserved` must be zero;
+- `session_id` must be a nonzero cryptographically random value;
 - nonzero `target_pid` must resolve to a live process;
-- `target_pid == 0` clears the active target;
+- `target_pid == 0` clears the active target only for the registered session;
+- a different session cannot replace or clear the active registration;
 - a target process-exit callback clears the active PID after queuing the exit
   event;
-- target changes clear queued events from the previous target;
+- target changes preserve queued events;
 - a `TARGET_CHANGED` event is inserted after the update.
 
 Only one target is active at a time.
@@ -159,6 +162,7 @@ typedef struct AcDriverStats {
     uint32_t queue_depth;
     uint32_t queue_capacity;
     uint32_t callbacks_active;
+    uint64_t session_id;
 } AcDriverStats;
 ```
 
@@ -169,8 +173,8 @@ typedef struct AcDriverStats {
 | `0x1` | Process callback registered. |
 | `0x2` | Image-load callback registered. |
 
-The client must monitor `events_dropped`. Any increase indicates that the
-oldest queued event was overwritten.
+The client must verify `session_id` and monitor `events_dropped`. Any increase
+indicates that the oldest queued event was overwritten.
 
 ## Event structure
 
@@ -316,6 +320,8 @@ CloseHandle(device);
 Use `src/kernel_client.c` as the canonical implementation. It:
 
 - validates all version and size fields;
+- generates a nonzero session ID with the Windows system RNG;
+- verifies that driver statistics remain bound to that session;
 - drains bounded batches;
 - converts UTF-16 paths to UTF-8;
 - emits JSONL records;

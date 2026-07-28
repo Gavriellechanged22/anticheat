@@ -14,6 +14,7 @@ endfunction()
 # It has no Windows dependency so the logic can be built and tested anywhere.
 add_library(anticheat_portable STATIC
     src/dedup.c
+    src/pe.c
     src/ranges.c
     src/sha256.c
     src/text.c
@@ -39,6 +40,13 @@ if(BUILD_TESTING)
         dedup_suppresses_repeats
         dedup_zero_interval
         dedup_saturation
+        pe_parse_valid
+        pe_materialize_rebase
+        pe_mask_imports
+        pe_iat_slots
+        pe_malformed_bounds
+        pe_rejects_non_pe
+        pe_relocation_bounds
     )
     foreach(test_case IN LISTS AC_PORTABLE_TEST_CASES)
         add_test(
@@ -102,13 +110,14 @@ if(NOT WIN32)
 endif()
 
 add_library(anticheat_core STATIC
+    src/integrity.c
     src/kernel_client.c
     src/log.c
     src/process.c
     src/scanner.c
 )
 target_include_directories(anticheat_core PUBLIC src include)
-target_link_libraries(anticheat_core PUBLIC anticheat_portable)
+target_link_libraries(anticheat_core PUBLIC anticheat_portable bcrypt)
 target_compile_definitions(anticheat_core PUBLIC
     UNICODE
     _UNICODE
@@ -121,6 +130,9 @@ ac_enable_warnings(anticheat_core)
 
 add_executable(anticheat src/main.c)
 target_link_libraries(anticheat PRIVATE anticheat_core)
+if(MINGW)
+    target_link_options(anticheat PRIVATE -municode)
+endif()
 ac_enable_warnings(anticheat)
 
 if(BUILD_TESTING)
@@ -140,6 +152,11 @@ if(BUILD_TESTING)
         policy_defaults
         least_privilege_process_access
         self_scan
+        integrity_clean_process
+        integrity_patched_text
+        integrity_module_identity
+        integrity_budget_gap
+        driver_protocol_session
     )
     foreach(test_case IN LISTS AC_CORE_TEST_CASES)
         add_test(
