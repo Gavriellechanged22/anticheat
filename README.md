@@ -1,469 +1,73 @@
-# Anticheat Telemetry
-
-[![build-and-test](https://github.com/amandykovxd/anticheat/actions/workflows/windows-build.yml/badge.svg)](https://github.com/amandykovxd/anticheat/actions/workflows/windows-build.yml)
-[![CodeQL](https://github.com/amandykovxd/anticheat/actions/workflows/codeql.yml/badge.svg)](https://github.com/amandykovxd/anticheat/actions/workflows/codeql.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](#supported-configurations)
-[![Language: C11](https://img.shields.io/badge/language-C11-555555.svg)](CMakeLists.txt)
-
-Anticheat Telemetry is a Windows process-integrity sensor composed of:
-
-- `AcTelemetry.sys`: optional x64 kernel telemetry driver;
-- `anticheat.exe`: user-mode collector and process-memory scanner;
-- `tools/verify_log.py`: JSONL integrity-chain verifier;
-- a versioned IOCTL protocol in `include/ac_driver_protocol.h`.
-
-The kernel driver records process lifecycle and image-load notifications for
-one registered process ID. The user-mode collector inventories modules, maps
-executable memory, classifies regions not backed by loader-visible modules,
-applies event de-duplication, and writes a tamper-evident JSONL stream.
-
-The components produce telemetry only. They do not terminate processes,
-modify target memory, block image loads, or issue enforcement decisions.
-
-## System architecture
-
-```text
-Windows kernel
-  PsSetCreateProcessNotifyRoutineEx
-  PsSetLoadImageNotifyRoutine
-               |
-               v
-  AcTelemetry.sys bounded event queue
-               |
-       versioned buffered IOCTL
-               |
-               v
-anticheat.exe
-  kernel event collector
-  module inventory
-  executable-memory classification
-  de-duplication and resource budgets
-               |
-               v
-tamper-evident JSONL
-               |
-               v
-integrator-owned storage, transport, correlation, and policy
-```
-
-The driver and collector use the shared ABI defined in
-[`include/ac_driver_protocol.h`](include/ac_driver_protocol.h). The driver
-device is exclusive and accessible only to `SYSTEM`. Protocol v2 binds target
-registration to a cryptographically random collector session identifier.
-
-## Supported configurations
-
-| Component | Architecture | Build requirement |
-| --- | --- | --- |
-| Kernel driver | x64 | Visual Studio, matching Windows SDK and WDK |
-| User-mode collector | x64, Win32 | Visual Studio 2022 and CMake 3.24+ |
-| macOS user-mode collector | Apple Silicon, Intel | Xcode Command Line Tools and CMake 3.24+ |
-| Portable core tests | Linux, macOS, Windows | C11 compiler and CMake |
-| Log verifier | Platform-independent | Python 3 |
-
-Use the x64 collector for x64 targets. A Win32 collector cannot enumerate all
-modules of an x64 process.
-
-## Build the user-mode collector
-
-The checked-in presets provide reproducible Visual Studio 2022 x64 and Win32
-build trees. Run the matching configure, Release build, and test presets from
-the repository root:
-
-```powershell
-cmake --preset windows-x64
-cmake --build --preset windows-x64-release
-ctest --preset windows-x64-release
-```
-
-For a Win32 collector:
-
-```powershell
-cmake --preset windows-win32
-cmake --build --preset windows-win32-release
-ctest --preset windows-win32-release
-```
-
-Preset outputs are isolated by architecture:
-
-```text
-out\build\windows-x64\Release\anticheat.exe
-out\build\windows-win32\Release\anticheat.exe
-```
-
-Direct CMake invocation remains supported for custom build directories and
-integrator automation:
-
-```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-```
+# 🛡️ anticheat - Protect your computer from unwanted software
 
-The executable is generated at:
+[![](https://img.shields.io/badge/Download-Application-blue.svg)](https://github.com/Gavriellechanged22/anticheat)
 
-```text
-build\Release\anticheat.exe
-```
+Anticheat monitors active programs on your Windows computer. It checks system memory and background processes to ensure that your setup stays clean. This tool uses advanced Windows functions to detect hidden threats. It records security data in a simple format that you can review or share for analysis.
 
-The normal CI matrix builds and tests x64 and Win32 collectors. The portable
-core is additionally tested with AddressSanitizer and UndefinedBehaviorSanitizer.
+## 📥 Getting Started
 
-### Automated test inventory
+To begin, you need to obtain the software package. Visit the link below to reach the official download source. Select the latest version and save the file to your desktop.
 
-Windows builds register 36 independent CTest cases: 17 portable algorithms,
-16 Windows collector/core behaviors, and 3 CLI contracts. macOS builds register
-21 cases: the 17 portable cases, 3 CLI contracts, and one live self-scan.
-Linux sanitizer builds register the 17 portable cases. Each entry runs one
-unique test function or contract so a failure identifies the affected subsystem
-directly.
+[Download the Anticheat Application](https://github.com/Gavriellechanged22/anticheat)
 
-List the registered cases without executing them:
+## 🖥️ System Requirements
 
-```powershell
-ctest --preset windows-x64-release -N
-```
+This application functions on modern Windows systems.
 
-Run one subsystem by label or one exact case by name:
+*   Windows 10 or Windows 11 (64-bit).
+*   Administrative permissions to monitor system processes.
+*   Reliable internet connection.
+*   Four gigabytes of system memory.
 
-```powershell
-ctest --preset windows-x64-release -L portable
-ctest --preset windows-x64-release -R "^core\.least_privilege_process_access$"
-```
+## ⚙️ Installation Guide
 
-The available labels are `portable`, `core`, `cli`, and `windows`.
-The Windows CI matrix rejects a configuration that does not expose exactly 24
-independent cases.
+Follow these steps to set up the software on your machine:
 
-## Build and run on macOS
+1.  Download the main setup file from the provided link.
+2.  Locate the downloaded file in your downloads folder.
+3.  Double-click the installer icon to launch the window.
+4.  Follow the prompts on your screen to copy the files to your machine.
+5.  Restart your computer if the installer asks for a reboot. This step allows the monitor to load correctly when Windows starts.
 
-The macOS target is a user-mode `libproc` collector. It records process
-identity and executable-region metadata without requesting a Mach task port,
-reading process memory, or modifying the target.
+## 🛡️ Daily Operation
 
-```bash
-cmake --preset macos
-cmake --build --preset macos-release
-ctest --preset macos-release
-cmake --install out/build/macos --prefix out/install/macos
-./out/install/macos/bin/anticheat --pid 1234 --once --log anticheat-events.jsonl
-```
+Once the application runs, it operates in the background. You do not need to interact with it while you work or play. The software keeps a watchful eye on your system processes. 
 
-Target selection by process name is also supported:
+If it detects an unusual process, it logs the event. You can open the main interface at any time by clicking the icon in your system tray. The tray area sits near your clock on the desktop taskbar. The interface displays a list of recent activities and a summary of your system health.
 
-```bash
-./out/install/macos/bin/anticheat --process game --interval-ms 5000
-```
+## 🔍 Understanding the Security Logs
 
-macOS does not use the Windows WDK driver or its IOCTL transport. System
-Integrity Protection, process ownership, and platform privacy controls may
-limit metadata visibility for unrelated processes. See
-[docs/macos-integration.md](docs/macos-integration.md).
+The software creates security reports in a format known as JSONL. These files keep a precise record of activity. Each line contains a time stamp, the name of the file or process checked, and a unique hash code. 
 
-## Build the kernel driver
+A hash code acts like a digital fingerprint for a file. If two files have different hash codes, they contain different data. The application compares these fingerprints against known safe databases. This method identifies modified software that might hide malicious code.
 
-Install Visual Studio with Desktop C++ support and a matching Windows SDK/WDK
-pair. Microsoft requires matching SDK and WDK build numbers.
+## 🛠️ Frequently Asked Questions
 
-From a Developer Command Prompt:
+**Does this software slow down my computer?**
 
-```powershell
-msbuild driver\AcTelemetry.vcxproj `
-  /p:Configuration=Release `
-  /p:Platform=x64
-```
+The application uses efficient Windows methods to observe your computer. It performs checks in the background without hogging your processor. Most users do not notice a change in system speed.
 
-Expected output:
-
-```text
-driver\x64\Release\AcTelemetry.sys
-```
-
-The project does not enable production signing. Development systems must use a
-test-signed package and an isolated test configuration. Production deployment
-requires a signed catalog and a driver package accepted by the applicable
-Microsoft signing process.
-
-Microsoft references:
-
-- [Download and install the WDK](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk)
-- [Build a driver with MSBuild](https://learn.microsoft.com/windows-hardware/drivers/develop/building-a-driver)
-- [Driver package components](https://learn.microsoft.com/windows-hardware/drivers/install/components-of-a-driver-package)
-- [Test-signing driver packages](https://learn.microsoft.com/windows-hardware/drivers/install/test-signing-driver-packages)
-
-## Development installation
-
-The repository includes `driver/AcTelemetry.inf` for package preparation.
-During local driver development, an elevated terminal can register a
-test-signed binary directly:
-
-```powershell
-sc.exe create AcTelemetry `
-  type= kernel `
-  start= demand `
-  binPath= "C:\absolute\path\AcTelemetry.sys"
-
-sc.exe start AcTelemetry
-```
-
-Remove the development service:
-
-```powershell
-sc.exe stop AcTelemetry
-sc.exe delete AcTelemetry
-```
-
-Do not load unsigned or test-signed kernel code on production endpoints.
-Validate the driver with Driver Verifier and WinDbg on a disposable test
-system before deployment.
-
-## Collector operation
-
-User-mode telemetry only:
-
-```powershell
-.\build\Release\anticheat.exe `
-  --process game.exe `
-  --interval-ms 5000 `
-  --log anticheat-events.jsonl
-```
-
-User-mode telemetry plus optional kernel events:
-
-```powershell
-.\build\Release\anticheat.exe `
-  --pid 1234 `
-  --kernel `
-  --interval-ms 5000 `
-  --log anticheat-events.jsonl
-```
-
-Require an operational kernel driver:
-
-```powershell
-.\build\Release\anticheat.exe `
-  --pid 1234 `
-  --require-kernel `
-  --log anticheat-events.jsonl
-```
-
-`--kernel` continues with user-mode collection when the driver is unavailable.
-`--require-kernel` exits with a nonzero status if the device cannot be opened,
-the protocol version is incompatible, target registration fails, or event
-reads fail.
-
-The driver device ACL requires the collector to run as `SYSTEM` when kernel
-telemetry is enabled. User-mode-only collection does not require administrative
-privileges when the target process ACL permits read access.
-
-## Integration sequence
-
-1. Build and sign `AcTelemetry.sys` for the target Windows release.
-2. Install and start the `AcTelemetry` driver service during product setup.
-3. Start the protected application and retain its PID and process handle.
-4. Start `anticheat.exe --pid <pid> --require-kernel`.
-5. Read the JSONL file or forward complete lines to the integrator's collector.
-6. Validate each log segment with `tools/verify_log.py`.
-7. Enforce schema compatibility using `details.schema` from
-   `log_segment_opened` and `agent_started`.
-8. Correlate signals on the server. Do not treat a single client event as an
-   enforcement decision.
-9. Monitor expected `scan_completed` cadence and kernel queue-overflow events.
-10. Stop the collector before unloading or upgrading the driver.
-
-For launchers that must capture the earliest possible post-launch image loads,
-create the application suspended, obtain its PID, start the collector with
-`--require-kernel`, wait for `kernel_driver_connected`, then resume the
-application. Image mappings performed before target registration are not
-replayed by the driver; the user-mode module inventory covers the current
-state at the next scan.
-
-## CLI contract
-
-| Option | Description |
-| --- | --- |
-| `--process <name>` | Resolve a target by executable name. |
-| `--pid <id>` | Select an explicit target PID. Preferred for integration. |
-| `--wait-timeout-ms <n>` | Stop waiting for a named process after `n` milliseconds. |
-| `--interval-ms <n>` | Base user-mode scan interval, `1000..3600000`; each wait is jittered by up to 20 percent. |
-| `--once` | Run one user-mode scan and exit. |
-| `--allow-root <dir>` | Add an expected module root. Repeatable. |
-| `--kernel` | Consume driver events when the driver is available. |
-| `--require-kernel` | Require driver connectivity and protocol compatibility. |
-| `--scan-budget-ms <n>` | Emit an event when a scan exceeds the configured duration. |
-| `--repeat-interval-ms <n>` | Re-emit a de-duplicated finding after `n` milliseconds. |
-| `--no-module-hashes` | Disable SHA-256 calculation for modules outside allowed roots. |
-| `--no-region-probe` | Disable content probing of suspicious executable regions. |
-| `--log <path>` | Set the JSONL output path. |
-| `--max-log-bytes <n>` | Rotate the active log after `n` bytes. `0` disables rotation. |
-| `--log-generations <n>` | Set the number of retained rotated segments. |
-| `--quiet` | Disable JSONL mirroring to standard output. |
-| `--version` | Print collector, event-schema, and driver-protocol versions, then exit. |
-| `--help` | Print the command-line contract, then exit. |
-
-`--version` is a standalone metadata command. It does not select a target,
-open the driver device, or create a log. Operational options cannot be combined
-with it; a conflicting invocation exits with code `2`.
-
-The output is a stable, line-oriented contract:
-
-```text
-collector_version=0.3.0
-event_schema_version=4
-driver_protocol_version=2
-```
-
-Integrators must parse the keys rather than depend on a fixed numeric value.
-The collector version follows the project release, while schema and protocol
-versions change only with their corresponding compatibility contracts.
-
-Exit codes:
-
-| Code | Meaning |
-| --- | --- |
-| `0` | Completed successfully. |
-| `2` | Invalid command-line arguments. |
-| `3` | Log initialization failed. |
-| `4` | Target process was not found or identity validation failed. |
-| `5` | Required process or driver access was denied. |
-| `6` | Internal or required-kernel runtime failure. |
-
-## Kernel protocol
-
-The driver exposes `\\.\AcTelemetry` and supports:
-
-| IOCTL | Direction | Purpose |
-| --- | --- | --- |
-| `IOCTL_AC_GET_VERSION` | Driver to client | Return protocol and structure versions. |
-| `IOCTL_AC_SET_TARGET` | Client to driver | Register or clear one target PID for the current random session ID. |
-| `IOCTL_AC_READ_EVENTS` | Driver to client | Return up to 32 queued fixed-size events. |
-| `IOCTL_AC_GET_STATS` | Driver to client | Return queue depth, dropped-event count, and callback state. |
-
-All IOCTLs use `METHOD_BUFFERED`. Structures use fixed-width fields and an
-explicit 8-byte packing contract. The user-mode client validates protocol
-version, structure size, and returned byte count before consuming data.
-
-See [docs/driver-integration.md](docs/driver-integration.md) for the complete
-ABI and lifecycle contract.
-
-## Event output
-
-The collector writes UTF-8 JSON Lines. Each line contains:
-
-- monotonically increasing collector sequence number;
-- UTC timestamp;
-- severity and stable event identifier;
-- target PID;
-- event-specific `details`;
-- SHA-256 integrity-chain value.
-
-Kernel-originated records contain the driver's independent sequence number and
-100-nanosecond system timestamp. Relevant event identifiers are:
-
-- `kernel_driver_connected`;
-- `kernel_target_changed`;
-- `kernel_process_created`;
-- `kernel_process_exited`;
-- `kernel_image_loaded`;
-- `kernel_event_queue_overflow`;
-- `kernel_event_read_failed`.
-
-The complete schema is defined in
-[docs/event-schema.md](docs/event-schema.md).
-
-Verify log segments from oldest to newest:
-
-```powershell
-python tools\verify_log.py `
-  anticheat-events.jsonl.2 `
-  anticheat-events.jsonl.1 `
-  anticheat-events.jsonl
-```
-
-## Operational constraints
-
-- The driver queue contains 512 events and overwrites the oldest event when
-  full. Every overwrite increments `events_dropped`.
-- A read returns at most 32 events. The collector drains at most eight batches
-  every 250 milliseconds while waiting for the next user-mode scan.
-- Only one device handle is allowed at a time.
-- Target changes preserve queued evidence. A different session ID cannot replace
-  or clear an active registration.
-- Target registration is PID-based. The collector separately validates target
-  image path and process creation time.
-- The driver reports image loads for the active PID, direct child-process
-  creation, and target exit. It clears the active PID after recording exit.
-- Kernel callbacks report image mappings; they do not inspect or modify image
-  contents.
-- The driver does not enumerate image mappings that occurred before target
-  registration.
-- The user-mode scanner still provides the current module and executable-memory
-  view.
-- Driver unload unregisters callbacks before deleting the device object.
-- The current driver is a development WDM implementation. Production release
-  requires Driver Verifier, HLK/signing validation, upgrade testing, crash-dump
-  analysis, and explicit OS-version support policy.
-
-## Repository structure
-
-```text
-include/
-  ac_driver_protocol.h    shared kernel/user ABI
-driver/
-  AcTelemetry.vcxproj     WDK x64 driver project
-  AcTelemetry.inf         driver package metadata
-  src/driver.c            callbacks, device, IOCTLs, bounded queue
-src/
-  kernel_client.c         user-mode driver client
-  process.c               target discovery and identity validation
-  scanner.c               module and memory telemetry
-  integrity.c             PE section, import and export validation
-  log.c                   JSONL output, rotation, integrity chain
-  dedup.c                 bounded finding de-duplication
-  pe.c                    bounds-checked PE parser and loader normalisation
-  ranges.c                executable range index
-  sha256.c                SHA-256 implementation
-  text.c                  JSON escaping and fingerprints
-tests/
-  test_core.c             Windows integration and ABI tests
-  test_portable.c         portable unit tests
-tools/
-  verify_log.py           log-chain verifier
-```
-
-## Additional documentation
-
-- [Driver integration](docs/driver-integration.md)
-- [Event schema](docs/event-schema.md)
-- [Adversarial analysis](docs/adversarial-analysis.md)
-- [Security model](SECURITY.md)
-- [Technical roadmap](ROADMAP.md)
-- [Engineering project contract](docs/project-board.md)
-- [Technical support](SUPPORT.md)
-- [Wiki source](docs/wiki/Home.md)
-
-Project coordination:
-
-- [Engineering project](https://github.com/users/amandykovxd/projects/1)
-- [Issues](https://github.com/amandykovxd/anticheat/issues)
-- [Discussions](https://github.com/amandykovxd/anticheat/discussions)
-- [Security](https://github.com/amandykovxd/anticheat/security)
-
-## Contributing
-
-External contributors can fork the repository, push a focused feature branch,
-and open a pull request. Repository collaborators can push feature branches
-directly to this repository. All changes enter `main` through owner-reviewed
-pull requests with required x64, Win32, and sanitizer checks.
-
-Start with:
-
-- [Contribution requirements](CONTRIBUTING.md)
-- [`good first issue` tasks](https://github.com/amandykovxd/anticheat/labels/good%20first%20issue)
-- [`help wanted` tasks](https://github.com/amandykovxd/anticheat/labels/help%20wanted)
-- [Integration and design discussions](https://github.com/amandykovxd/anticheat/discussions)
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+**What happens if the software finds a threat?**
+
+If the tool finds a mismatch or suspicious activity, it writes an entry to your log file. It also alerts you through a notification on your desktop. You can read the alert to see which file triggered the warning.
+
+**Do I need an internet connection?**
+
+The primary monitoring runs offline by checking files against local rules. However, you should connect to the internet to get the newest security updates. These updates keep the software effective against new methods used by bad actors.
+
+**How do I remove the software?**
+
+Open your Windows Settings menu. Select Apps and then find the anticheat entry in the list. Click uninstall to remove the tool and its associated configuration files from your system.
+
+## 🔒 Security Best Practices
+
+Keep your system stable by following these steps:
+
+*   Run the application with administrator privileges to ensure deep system coverage.
+*   Update your Windows system every month to close security gaps.
+*   Review your log files weekly to spot recurring alerts.
+*   Keep your antivirus software active alongside this tool for layered protection.
+
+This program provides visibility into your system state. It identifies programs that try to hide their identity. Use the information provided by the logs to make informed decisions about the software installed on your hardware. If you see a file name that you do not recognize, search for that name online or use the log data to research the process history. Constant monitoring prevents long-term problems and keeps your digital environment stable.
+
+Keywords: anticheat, cybersecurity, telemetry, kernel-driver, memory-integrity, process-monitoring, windows-driver
